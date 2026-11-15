@@ -241,6 +241,8 @@ pub const MACHINES: &[(&str, &str)] = &[
     ("Sienci AltMill 2x4", include_str!("../../../assets/machines/sienci-altmill-2x4.mch")),
     ("Sienci AltMill 4x4", include_str!("../../../assets/machines/sienci-altmill-4x4.mch")),
     ("Sienci AltMill 4x8", include_str!("../../../assets/machines/sienci-altmill-4x8.mch")),
+    // #714: the 4x4 with Sienci's closed-loop Vortex on the SLB-EXT's A output (gSender's 4th Axis Mode).
+    ("Sienci AltMill 4x4 + Vortex", include_str!("../../../assets/machines/sienci-altmill-4x4-vortex.mch")),
     // #614: Doosan DNM 5700 VMC (Fanuc 0i-MF). #1433: the plain 3-axis
     // machine, and the catalog's optional A table as its own entry (no
     // published nose_to_axis, so that one refuses until a setup states it).

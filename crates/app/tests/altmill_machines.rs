@@ -84,7 +84,7 @@ fn every_altmill_states_its_figures() {
         let m = shipped(n);
         assert_eq!(m.model, n);
         assert_eq!(m.units, None, "{n}: mm (the parser records only inch) - the SLB-EXT runs G21");
-        assert_eq!(m.axes.len(), 3, "{n}: X, Y, Z - the Vortex rotary waits on #714");
+        assert_eq!(m.axes.len(), 3, "{n}: X, Y, Z - the Vortex is its own file, \"Sienci AltMill 4x4 + Vortex\" (#714)");
         for (a, want) in m.axes.iter().zip(s.travel) {
             // The full stroke either way from the work zero, as every
             // shipped machine writes it.

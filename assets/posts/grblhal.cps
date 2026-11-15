@@ -8,8 +8,10 @@
 // post docs. No vendor or CAM post script text and no other CAM's output
 // used; original work. Structure follows our own tormach.cps (coolant and
 // after-operation handling as in mazak.cps); the goldens lock this file's
-// decisions.
-description = "grblHAL (3-axis mill, G20/G21 from the document, G73/G81/G82/G83/G86/G89, G2/G3, G98; no G41/G42, no G84, no probing macros)";
+// decisions. The 4th-axis indexing (#714) follows our own tormach.cps
+// (#785); the A word is a rotary position in degrees, as in the LinuxCNC
+// reference and grblHAL's core README (A/B/C axes) - behavior only.
+description = "grblHAL (3-axis mill, A indexing about X, G20/G21 from the document, G73/G81/G82/G83/G86/G89, G2/G3, G98; no G41/G42, no G84, no probing macros)";
 vendor = "Camcraft";
 legal = "Original clean-room work; public documentation only";
 certificationLevel = 1;
@@ -72,7 +74,13 @@ function block(words) {  // join the non-empty words onto one line
   }
   if (a.length > 0) writeln(a.join(" "));
 }
-function xyz(p) { return [wo("X", p.X, orgX), wo("Y", p.Y, orgY), wo("Z", p.Z, orgZ)]; }
+function xyz(p) {
+  if (indexed()) {  // #714: the whole tip, turned into the indexed frame
+    var q = tip(p.X, p.Y, p.Z);
+    return ["X" + fu(q[0]), "Y" + fu(q[1]), "Z" + fu(q[2])];
+  }
+  return [wo("X", p.X, orgX), wo("Y", p.Y, orgY), wo("Z", p.Z, orgZ)];
+}
 function wo(letter, v, o) { return has(v) ? letter + fu(v - o) : ""; }  // axis word, origin-relative
 function msg(s) {  // counted warning where the host offers message()
   if (typeof message === "function") message(s); else writeln("(" + s + ")");
@@ -101,12 +109,6 @@ function spindleStopped(what) {  // true: refused, nothing is posted
   return true;
 }
 var tapRefused = false;   // the tapping refusal, once per program
-var tiltRefused = false;  // one named refusal per program, not per line
-function tiltOk(p) {  // this post is 3-axis: a tilted record is refused
-  if (!has(p.A)) return true;
-  if (!tiltRefused) { tiltRefused = true; msg("tilted move - grblHAL post has no RTCP output"); }
-  return false;
-}
 
 // ------------------------------------------------------------ coolant
 // The .mch tool-station coolant list carries names + M-codes. A flood
@@ -387,6 +389,10 @@ function endPreamble() {
   if (!sectionOpen) return;
   restorePlane();            // the plane never leaks past its section
   sectionOpen = false;
+  aSection = null;           // #714: the next section indexes afresh
+  aNow = null;               // ... and restates A: a section boundary is
+                             // where an operator may stop and jog (M0/M1,
+                             // a tool change), so no section inherits A
   smoothOff();
   if (inCycle) block(["G80"]);
   inCycle = false;
@@ -401,7 +407,140 @@ function endPreamble() {
 }
 
 function onSection() { startPreamble(); }
-function onSectionEnd() { endPreamble(); clearZ = null; hopZ = null; }  // #1616: the next section states its own planes
+function onSectionEnd() { endPreamble(); clearZ = null; hopZ = null; }  // #1616: the next section states its own planes  // #1616: the next section states its own planes
+
+// ------------------------------------------------------- the 4th axis
+// #714. A rotary about X (Sienci's Vortex on an AltMill's A output, or any
+// grblHAL machine with an A axis along X) indexes the part between
+// operations; nothing here is RTCP. The law is tormach.cps's (#785):
+// - The machine file states it: a rotary named A whose `axis` lies along
+//   X. The vector's sign is the direction sense: [1,0,0] reads the RS-274 /
+//   ISO 841 way - a + A turns the TOOL right-handed about +X relative to
+//   the part (the rotary turns the part the other way) - so the stream's
+//   tool angle A posts as itself; [-1,0,0] posts it negated.
+// - Indexing only. A moves alone, as G0 A.., after G53 G0 Z to the
+//   machine's safe retract, at a section's first motion; no A word ever
+//   rides a cutting move. A section's tilted path is then written in the
+//   indexed frame: the tip relative to the work offset turned by -A about
+//   X, so WCS Y0 Z0 must lie on the A centerline (the note at the first
+//   index; Sienci's own Vortex setup zeroes Z on the axis center).
+// - The lift before a turn is in machine coordinates only: without a
+//   stated safe_retract this post's lift is a work-offset height, and a
+//   work-offset Z means nothing once the part has turned. So an index on a
+//   machine that states no safe Z retract is refused by name.
+// - Refused by name: a tilt the A axis cannot reach (any B or C), an A
+//   past the stated travel, an A that changes inside an operation
+//   (simultaneous 4-axis: grblHAL's feed for a combined linear and rotary
+//   move is not stated here, and its A rollover is the controller's
+//   setting), an indexed arc (a tilted path is chords), an indexed canned
+//   cycle (a cycle drills upright), and a tilted move on a machine with no
+//   A about X.
+// A machine with an A states it at every section's first motion (G0 A0
+// for an upright section): a program never assumes where the last run,
+// the last section, or a sender's tool-change routine left it.
+var A_EPS = 1e-6;
+var aAxis;               // undefined: not judged; null: no A about X stated
+var aNow = null;         // the A word the control holds (null: unknown)
+var aSection = null;     // the tool angle this section is indexed to
+var aRefused = false;    // one named 4th-axis refusal per program
+var aNoted = false;      // the operator note, at the first index
+function fa(v) { return trim(Number(v).toFixed(3)); }  // degrees, never scaled
+function mName() { return (typeof machine !== "undefined" && machine.name) || "this machine"; }
+function inOp() { return coolantOp ? " in operation " + coolantOp : ""; }
+function aRotary() {
+  if (aAxis !== undefined) return aAxis;
+  aAxis = null;
+  var rs = (typeof machine !== "undefined" && machine.rotaries) || [];
+  for (var i = 0; i < rs.length; i++) {
+    var r = rs[i], d = r.direction;
+    if (String(r.name || "").toUpperCase() !== "A" || !d || d.length !== 3) continue;
+    if (!has(d[0]) || !has(d[1]) || !has(d[2])) continue;
+    var n2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    if (!(n2 > 0) || d[0] * d[0] < 0.998 * n2) continue;  // not along X
+    var t = r.travel;
+    var travel = (t && t.length === 2 && has(t[0]) && has(t[1]) && t[1] > t[0]) ? [Number(t[0]), Number(t[1])] : null;
+    aAxis = { sign: d[0] > 0 ? 1 : -1, travel: travel };
+    break;
+  }
+  return aAxis;
+}
+function aRefuse(s) {
+  if (!aRefused) { aRefused = true; msg(s); }
+  return false;
+}
+// The tool angle about X a tilted record stands for, or null when no A
+// about X reaches it. The pose law (`cl::pose`): the tool axis is
+// Rz(C)·Ry(B)·Rx(A)·Z. An A about X reaches exactly the axes with no X
+// component, (0, -sin a, cos a), so the letters are read through the
+// axis: the pose's canonical A 0 B 180 (the face underneath) is a = 180.
+function toolAngle(a0, b0, c0) {
+  if (Math.abs(c0) > A_EPS) return null;
+  var r = Math.PI / 180;
+  var sa = Math.sin(a0 * r), ca = Math.cos(a0 * r), sb = Math.sin(b0 * r), cb = Math.cos(b0 * r);
+  var ax = ca * sb, ay = -sa, az = ca * cb;
+  if (Math.abs(ax) > 1e-9) return null;
+  var a = Math.atan2(-ay, az) / r;
+  if (a <= -180 + A_EPS) a = 180;     // one name for the face underneath
+  return Math.abs(a) < 1e-9 ? 0 : a;
+}
+// Called before every motion: true when the record may post. Indexes the
+// rotary at the section's first motion, when its angle is not the held one.
+function indexFor(p) {
+  var tilted = has(p.A);
+  var ax = aRotary();
+  if (!ax) {
+    if (!tilted) return true;
+    return aRefuse("tilted move" + inOp() + " - " + mName() + " states no A rotary about X; the grblHAL post indexes only an A about X and has no RTCP output");
+  }
+  var a = 0;
+  if (tilted) {
+    var a0 = Number(p.A), b0 = has(p.B) ? Number(p.B) : 0, c0 = has(p.C) ? Number(p.C) : 0;
+    var t = toolAngle(a0, b0, c0);
+    if (t === null) {
+      return aRefuse("tilt A" + fa(a0) + " B" + fa(b0) + " C" + fa(c0) + inOp() + " - the A axis about X cannot reach it; " + mName() + " indexes A only");
+    }
+    if (!(has(p.X) && has(p.Y) && has(p.Z))) {
+      return aRefuse("indexed move" + inOp() + " without X Y Z - the indexed frame needs the whole tip");
+    }
+    a = t;
+  }
+  if (aSection !== null) {
+    if (Math.abs(a - aSection) > A_EPS) {
+      return aRefuse("simultaneous 4-axis motion" + inOp() + " (A changes inside the operation) - this post indexes A between operations only");
+    }
+    return true;
+  }
+  var word = ax.sign * a;
+  if (ax.travel && (word < ax.travel[0] - A_EPS || word > ax.travel[1] + A_EPS)) {
+    return aRefuse("A" + fa(word) + inOp() + " is beyond the A axis travel " + fa(ax.travel[0]) + ".." + fa(ax.travel[1]) + " degrees");
+  }
+  if (aNow === null || Math.abs(word - aNow) > A_EPS) {
+    var z = machineSafeZ();
+    if (z === null) {
+      return aRefuse("A index" + inOp() + " - " + mName() + " states no safe Z retract; the rotary turns only after a lift in machine coordinates (G53 G0 Z), so state the Z axis's safe_retract in the machine file");
+    }
+    if (!aNoted) {
+      aNoted = true;
+      note("4TH AXIS A ABOUT X - " + wcsWord + " Y0 Z0 ON THE A CENTERLINE");
+    }
+    block(["G53", "G0", "Z" + fu(z)]);   // straight up before the rotary turns
+    block(["G0", "A" + fa(word)]);
+    aNow = word;
+    xyUnknown = true;                    // the next move restates X Y first
+  }
+  aSection = a;
+  return true;
+}
+// The tip relative to the work offset, in the section's indexed frame:
+// turned by -A about X (the part's turn that stands the tool axis
+// (0, -sin A, cos A) up along Z). An upright section is the plain offset.
+function tip(x, y, z) {
+  var rx = x - orgX, ry = y - orgY, rz = z - orgZ;
+  if (!aSection) return [rx, ry, rz];
+  var t = aSection * Math.PI / 180, c = Math.cos(t), s = Math.sin(t);
+  return [rx, ry * c + rz * s, -ry * s + rz * c];
+}
+function indexed() { return !!aSection; }
 
 // ------------------------------------------------------------- motions
 // X and Y are unknown at the program's start and after every tool change
@@ -434,6 +573,15 @@ function traverseZ(z) {
 function xyFirst(x, y, z) {
   if (!xyUnknown || !has(x) || !has(y)) return;
   traversedAt = null;
+  if (indexed()) {
+    // #714: the index stood the tool at the machine's safe retract, the
+    // highest Z there is; X Y of the turned tip, which Z enters.
+    if (!has(z)) return;
+    var q = tip(x, y, z);
+    block(["G0", "X" + fu(q[0]), "Y" + fu(q[1])]);
+    xyUnknown = false;
+    return;
+  }
   var tz = traverseZ(z);
   if (tz === null) {
     if (!traverseRefused) {
@@ -457,9 +605,16 @@ function startXY(p) {
   if (!xyUnknown) return;
   if (has(p.StartX) && has(p.StartY)) xyFirst(p.StartX, p.StartY, p.StartZ);
   else xyFirst(p.X, p.Y, p.Z);
+  if (xyUnknown || !has(p.StartZ) || !has(p.Z) || !(p.StartZ > p.Z)) return;
+  if (indexed()) {
+    // #714: "above" is the indexed frame's Z, the tool axis.
+    if (!(has(p.StartX) && has(p.StartY))) return;
+    var s0 = tip(p.StartX, p.StartY, p.StartZ), e0 = tip(p.X, p.Y, p.Z);
+    if (s0[2] > e0[2]) block(["G0", "Z" + fu(s0[2])]);
+    return;
+  }
   // #1616: not when the stated traverse height already is it.
-  if (!xyUnknown && has(p.StartZ) && has(p.Z) && p.StartZ > p.Z &&
-      !(has(traversedAt) && Math.abs(traversedAt - p.StartZ) < 1e-9)) {
+  if (!(has(traversedAt) && Math.abs(traversedAt - p.StartZ) < 1e-9)) {
     block(["G0", wo("Z", p.StartZ, orgZ)]);
   }
 }
@@ -469,21 +624,25 @@ function startXY(p) {
 function onRapid() {
   startPreamble();
   seeZ(properties.Z);
-  if (!tiltOk(properties) || inCycle) return;
+  if (!indexFor(properties) || inCycle) return;
   xyFirst(properties.X, properties.Y, properties.Z);
   block(["G0"].concat(xyz(properties)));
 }
 function onLinear() {
   startPreamble();
   seeZ(properties.Z); seeZ(properties.StartZ);
-  if (!tiltOk(properties) || inCycle) return;
+  if (!indexFor(properties) || inCycle) return;
   if (spindleStopped("feed move G1")) return;
   startXY(properties);
   block(["G1"].concat(xyz(properties), [fw(properties.FeedRate)]));
 }
 function onCircular() {
   startPreamble();
-  if (!tiltOk(properties) || inCycle) return;
+  if (!indexFor(properties) || inCycle) return;
+  if (indexed()) {  // #714: a tilted path is chords; an arc here is unstated
+    aRefuse("arc on an indexed A" + inOp() + " - the indexed frame posts lines only");
+    return;
+  }
   if (spindleStopped("arc move " + (properties.CircularDirection === "CW" ? "G2" : "G3"))) return;
   var p = properties;
   seeZ(p.Z); seeZ(p.StartZ);
@@ -537,6 +696,14 @@ function onCycle() {
     msg("canned cycle " + g + " has no feed rate - refused: without F the control drills at whatever feed was last modal");
     return;
   }
+  // #714: a cycle record carries no A - it drills along G17's Z, upright.
+  // On an indexed section it is refused by name, before indexFor reads
+  // its missing A as a turn back to A0 inside the operation.
+  if (indexed()) {
+    aRefuse("canned cycle " + g + " on an indexed A" + inOp() + " - this post drills upright (A0) only");
+    return;
+  }
+  if (!indexFor(p)) return;
   if (spindleStopped("canned cycle " + g)) return;
   xyFirst(p.X, p.Y);         // a cycle as the first move: its first hole
   var sig = g + "|" + p.Z + "|" + p.R + "|" + p.Q;
