@@ -14,9 +14,9 @@ pub const SLOW_BINARIES: &[&str] = &[
     "motion:flow",              // ~42 s
     "app:center_cut_multiaxis", // ~40 s
 ];
-/// Crate dirs in dependency order. kernel builds a C chain (truck dev-dep) for its own tests: release
-/// tier and quick-when-touched only.
-pub const BATCH_CRATES: &[&str] = &["geometry", "cl", "tools", "post", "sim", "motion", "app"];
+/// Crate dirs in dependency order. kernel builds a C chain (truck dev-dep) and its debug suites take
+/// about 3 min: batch runs them since #1702, so the post-merge gate finds a kernel failure before a cut.
+pub const BATCH_CRATES: &[&str] = &["geometry", "kernel", "cl", "tools", "post", "sim", "motion", "app"];
 pub const ALL_CRATES: &[&str] = &[
     "geometry", "kernel", "cl", "tools", "post", "sim", "motion", "app", "ui",
 ];
@@ -152,7 +152,7 @@ pub fn clippy() -> Step {
 pub fn batch(root: &Path) -> Plan {
     let mut plan = Plan::default();
     plan.notes.push(format!(
-        "batch: debug suites minus SLOW_BINARIES ({}), ui, clippy",
+        "batch: debug suites (kernel included) minus SLOW_BINARIES ({}), ui, clippy",
         SLOW_BINARIES.join(", ")
     ));
     plan.steps.extend(run_suites(root, BATCH_CRATES, true));
