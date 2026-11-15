@@ -19,7 +19,7 @@ the property table there is the vocabulary, this file is the grammar.
 
 Manifest: top-level assignments only — `description`, `vendor`, `legal`,
 `certificationLevel`, `minimumRevision`, `extension`, `setCodePage`,
-`capabilities`, `serves`, `coolantModes`, `programUnits`, `liveTooling`, `afterModes`, `axisInversion`, `probeAxisInversion`, `threadHands`. All but `serves` and the last six are
+`capabilities`, `serves`, `coolantModes`, `programUnits`, `liveTooling`, `afterModes`, `axisInversion`, `probeAxisInversion`, `threadHands`, `workOffsetIndex`, `workOffsetMax`. All but `serves` and the last eight are
 text the engine reads none of; `serves = ["plasma"];` (#1266; one word or a list of kind words: mill, lathe, mill-turn, plasma, wire_edm, sinker_edm) names the machine kinds a script of the user's own posts to - the app refuses it by name on any other kind, and a script that states none is accepted only on a mill (non-turning dialect), a lathe (turning) or a mill-turn, never on a plasma table or an EDM; shipped posts are judged by registry name and need no `serves`; `programUnits = "mm inch"` (#902) says
 the script writes the program in the document's unit -
 `postOptions.Units`, `"mm"` or `"inch"`, absent = mm: the dialect's
@@ -34,9 +34,27 @@ appends `explain(words)` after its words - the PRELUDE helper that
 returns `""` unless the document's Explain G-code option is on, and
 applies the comment guards itself (printable ASCII, no delimiters, the
 active-keyword lead, the length cap) - and Explain on a script that
-states no form is refused by name before any hook runs; never read
+states no form is refused by name before any hook runs; a control that
+reads a word differently from the mill table states it (#1399):
+`explainWords = { G99: "FEED PER REVOLUTION", G50: { said: "SPINDLE
+SPEED LIMIT", takes: "S" } }` (a text, `""` to leave the word
+unexplained, or a word explained only beside the value word it folds
+in) and `explainTool = "station-offset"` (a lathe T0101 is tool 1,
+offset 1) - a malformed table is refused by name when Explain is on;
+never read
 `machine.units` for the program's unit, it is only the unit the
-machine file was written in; `threadHands = true` (#629) says the script
+machine file was written in; `workOffsetIndex = true` (#931) says the
+script reads `PARAM WorkOffset` as the 1-based offset number and writes
+its own word for it, up to `workOffsetMax` (6 when unstated) - the
+engine refuses a higher offset by setup name; without the flag the
+script receives the word `G54`..`G59` for offsets 1-6 and the engine
+refuses any offset above 6. A flagged script also defines
+`workOffsetName(n)`, its control's name for offset n (display only).
+Every shipped post sets it except grblhal.cps and tinyg.cps, which
+still take the word (offsets 1-6 only; follow-up issue); an extended word (`G59.1`, `G505`...) is
+written only where the control's public manual is cited (tormach.cps
+and tormach-lathe.cps: the LinuxCNC G-code reference's G59.1-G59.3);
+`threadHands = true` (#629) says the script
 reads `PARAM SpindleDirection` and states a thread's hand (M04 when the
 helix needs the spindle reversed) - without it the engine refuses a
 reverse-spindle thread section by name (fanuc-lathe.cps and tormach-lathe.cps set it); `liveTooling = true` (issue #33) says the
@@ -140,6 +158,15 @@ write (the gate), so the released program never carries one.
   everything the first raw motion line needs (`startPreamble`
   pattern), and serve legacy streams that carry no `SECTION` by
   firing it from the first motion too.
+- **The first traverse states its height (#1614).** After a tool
+  change (or a G30, or at the program's start) the top of Z travel
+  is not proof of clearance: a long tool on a high work offset can
+  stand below the part there. `tormach.cps` writes `G0 Z<ClearancePlane>`
+  (else the RetractPlane) before the first X/Y move, so a setup that
+  cannot clear is stopped by the control's Z limit instead of rapiding
+  through the part; a stream stating neither plane is refused by name,
+  and the refused move (with every later one while X/Y stay unknown) is
+  not written.
 - **A cycle states its feed; a cut needs a turning spindle (#1357).**
   A canned cycle whose `FeedRate` is missing or not positive is a
   `message()` refusal by name ("canned cycle G73 has no feed rate"),
@@ -192,7 +219,7 @@ LinuxCNC G7 / G33 / one-block G76, drilling as plain moves) — each
 addressed BY NAME through `BUILTINS` in `crates/app/src/posting.rs`;
 their dialect goldens ride under `nc/<dialect>/`. The knobs that
 legitimately differ: header delimiters (`%` vs `;` vs bare), the `O`
-word, spindle words (`S.. M3` vs `MOTON S..`), tool-change words
+word, spindle words (`S.. M3` vs Heidenhain's own `M3` block), tool-change words
 (`T.. M6`, +`D..` on Sinumerik), and whether a G98 retract word
 exists to write at all (DIN families retract to R by documented
 default — inventing a word is the same lying as omitting one).
@@ -221,6 +248,20 @@ D5), and a missing one is refused by name. The path is the wire-centre
 path, so compensation is cancelled, never engaged. Its golden rides
 under `nc/wire-iso/` (`wire_post.rs`); the decision record is
 `docs/decisions/533-wire-iso-post.md`.
+
+`sodick-wire.cps` (#617, "Sodick Wire EDM (Mark 21)") is the second
+`WIRE_POSTS` entry, never the default. Its words are Sodick's own, from
+the 1998 "Wire EDM Machine Operation" manual (Mark 21 / EX21 control):
+`T91` / `T90` thread and cut the wire (`edm.awt`), the operation's
+condition id is the `C` word itself (C and three digits, else refused;
+the header and each section tell the operator it must exist in the
+control's condition table), `G40` rides the `G00` to the threading point, a coordinate always carries its decimal point,
+`M02` ends. It reads no `edm.codes`. It writes a vertical 2-axis cut
+only: taper, 4-axis, a missing G54-G59 and an arc as the first cut are
+refused by name; G92, the tank and flushing T codes and G41 / G42 are
+never written. It was not run on a control; what is unconfirmed is in
+`docs/decisions/617-sodick-wire-post.md`. Its golden rides under
+`nc/sodick-wire/` (`sodick_wire_post.rs`).
 
 ## Adding a post to the app
 

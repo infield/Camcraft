@@ -549,6 +549,12 @@ pub(super) fn check_and_apply(world: &World, mut file: ProjectFile) -> Result<Ve
             Some("mm") => crate::schema::EndUnits::Millimeters,
             Some(other) => return Err(corrupt(format!("unknown end units {other:?}"))),
         },
+        // #1532: an absent key is the default pause between setups.
+        between_setups: match file.post_options.as_ref().and_then(|o| o.between_setups.as_deref()) {
+            None => crate::schema::BetweenSetups::default(),
+            Some(w) => crate::schema::BetweenSetups::from_word(w)
+                .ok_or_else(|| corrupt(format!("unknown between-setups choice {w:?}")))?,
+        },
     };
     // The program identity (#258): checked by `SetProgramInfo`'s rules,
     // so a hand-edited value they refuse is a corrupt file, refused
@@ -803,11 +809,13 @@ pub(super) fn check_and_apply(world: &World, mut file: ProjectFile) -> Result<Ve
                 let sdto = dto
                     .setup
                     .ok_or_else(|| corrupt("setup entity without a definition"))?;
-                // #196: the picked program offset is a G-word in the file;
-                // an unspellable one is a corrupt file, never a guess.
+                // #196, #931: the picked program offset is a G-word (1-6)
+                // or its 1-based number (7+) in the file; an unreadable one
+                // is a corrupt file, never a guess. The setup's post bounds
+                // it at post time, not here.
                 let work_offset = match sdto.work_offset.as_deref() {
                     None => None,
-                    Some(w) => Some(crate::schema::WCS_SLOTS.iter().position(|s| *s == w).ok_or_else(|| {
+                    Some(w) => Some(super::work_offset_pick(w).ok_or_else(|| {
                         corrupt(format!("setup '{}' picks unknown work offset {w:?}", dto.name))
                     })?),
                 };

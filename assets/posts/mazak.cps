@@ -1,7 +1,7 @@
 // Mazak 3X milling post. Provenance: the G-dialect from public
 // RS-274/ISO 6983 documentation and the control family's published
-// operator conventions - two-address motion words, spindle-logic M
-// words MOTON/MOTOFF with the speed on the same block (behavior only,
+// EIA/ISO programming conventions, which follow the Fanuc words (the
+// spindle is S.. M3 / M4 and stopped by M5, #1411; behavior only,
 // per this repo's Clean-Room Protocol); the hook contract from
 // Autodesk's published post docs. No vendor script text; original
 // work. Where a public convention leaves a hole, the house style
@@ -17,15 +17,20 @@ setCodePage = "utf-8";
 capabilities = 1; // reference contract: integer feature mask (bit 1 = milling)
 coolantModes = true; // reads PARAM Coolant (#112/#150): the engine refuses non-Flood ops for a post without it
 afterModes = true; // reads PARAM AfterOperation (#110): the engine refuses a stop or home ask for a post without it
+workOffsetIndex = true; // reads PARAM WorkOffset as the 1-based offset number (#931)
+workOffsetMax = 6;      // G54..G59; G54.1 P extended offsets not verified here (#931)
 programUnits = "mm inch"; // #902: writes the document's unit (postOptions.Units), G21 / G20
+millSpindleReverse = true; // reads PARAM MillSpindle (#988, #1411): M4 for a left-hand-cut mill; the engine refuses a reverse mill spindle for a post without it
 
 // Determinism law: no timestamps, no randomness - the same stream
 // always posts to the same text (golden files depend on it).
 
 // ---------------------------------------------------------------- state
 var wcsWord = "G54";       // from the WorkOffset PARAM
-var sRpm = 0;              // MOTON waits for the section: the stream
+var wcsIndex = 1;          // the offset number wcsWord writes (#931)
+var sRpm = 0;              // S.. M3 waits for the section: the stream
 var spindleWait = false;   // order is PARAMs, TOOL, SECTION
+var spinRev = false;       // PARAM MillSpindle reverse (#988): this section's spindle runs M4
 var toolWait = false;
 var tNo = 0;
 var inCycle = false;       // a cycle group is open; its chain is suppressed
@@ -86,7 +91,7 @@ function msg(s) {  // counted warning where the host offers message()
 }
 
 // #1359 (from #1357): a cut needs a turning spindle. spindleOn is true
-// from the preamble's spindle start (MOTON S..) to the next MOTOFF (every
+// from the preamble's spindle start (S.. M3 / M4) to the next M5 (every
 // section end, and a touch probe's stop). A touch probe's section feeds
 // its stylus with the spindle stopped on purpose: a section is a
 // probe's only when it states 0 rpm (#574) AND its tool is a touch
@@ -103,7 +108,7 @@ function spindleStopped(what) {  // true: refused, nothing is posted
   if (spindleOn || probeSection) return false;
   if (!spindleRefused) {
     spindleRefused = true;
-    msg(what + " with the spindle stopped - no spindle start (MOTON S..) precedes it; state the operation's spindle speed");
+    msg(what + " with the spindle stopped - no spindle start (S.. M3) precedes it; state the operation's spindle speed");
   }
   return true;
 }
@@ -329,15 +334,29 @@ function compRefuse(what) {
   }
 }
 
+// #931: PARAM WorkOffset arrives as the 1-based offset number (the engine
+// refuses one above workOffsetMax by setup name); the word is ours to write.
+function workOffsetName(n) {  // offset n -> this control's word; "" when it has none
+  return n >= 1 && n <= 6 && n === Math.floor(n) ? "G" + (53 + n) : "";
+}
+function offsetWord(value) {
+  var n = Number(value), w = workOffsetName(n);
+  if (!w) { msg("work offset " + value + " - this post expresses work offsets 1-" + workOffsetMax + " only"); return wcsWord; }
+  wcsIndex = n;
+  return w;
+}
+
 function onParameter(name, value) {
   if (name === "RetractPlane") hopZ = has(value) ? Number(value) : null;  // #1028
+  if (name === "ClearancePlane") clearZ = has(value) ? Number(value) : null;  // #1633
   if (name === "Smoothing") { smoothTol = Number(value) || 0; return; }
   if (name === "SmoothingMode") { smoothMode = String(value || ""); return; }
   commentParam(name, value);
-  if (name === "OperationName") coolantOp = String(value || "");
+  if (name === "OperationName") { coolantOp = String(value || ""); spinRev = false; }
+  if (name === "MillSpindle") { spinRev = String(value || "") === "reverse"; return; }
   if (name === "Coolant") { coolantAsk = String(value || "flood"); return; }
   if (name === "AfterOperation") { afterAsk = String(value || ""); return; }
-  if (name === "WorkOffset" && value) wcsWord = String(value);
+  if (name === "WorkOffset" && value) wcsWord = offsetWord(value);
   else if (name === "OriginX" && has(value)) orgX = Number(value);
   else if (name === "OriginY" && has(value)) orgY = Number(value);
   else if (name === "OriginZ" && has(value)) orgZ = Number(value);
@@ -358,8 +377,12 @@ function onToolChange(number, name) {
 }
 
 // The preamble closes over everything a raw motion line needs to be a
-// legal program. Spindle logic is an M-word of its own here: MOTON
-// carries the speed on the same block, MOTOFF ends the section.
+// legal program. #1411: the spindle words are the RS-274 / ISO 6983
+// ones - S.. with M3 (clockwise) or M4 (counter-clockwise, a left-hand-
+// cut mill) on one block, M5 to stop - so a G84 right-hand tap meets a
+// spindle stated clockwise. Never the multi-letter MOTON / MOTOFF this
+// post once wrote: no public document gives them, and they are no
+// address-letter-and-number word of the grammar this header names.
 // #616: per-operation smoothing. No Mazak smoothing form is stated from
 // its public documentation yet, so the ask is named once and nothing is
 // written - never a guessed word.
@@ -388,14 +411,15 @@ function startPreamble() {
     toolNote();
     block(["T" + ni(tNo), "M6"]);
     block(["G43", "H" + ni(tNo)]);
+    xyUnknown = true;          // #1633: the first traverse states its height again
     toolWait = false;
   }
   if (spindleWait && sRpm > 0) {   // a touch probe (#173) states no spindle
-    block(["MOTON", "S" + ni(sRpm)]);
+    block(["S" + ni(sRpm), spinRev ? "M4" : "M3"]);
     spindleOn = true;
     spindleWait = false;
   }
-  if (probeStop) { block(["MOTOFF"]); spindleOn = false; }
+  if (probeStop) { block(["M5"]); spindleOn = false; }
   probeSection = probeStop && kindProbe;
   // #995: a touch probe section starts no coolant, whatever its ask -
   // fluid on the stylus and the measured faces spoils the reading.
@@ -439,7 +463,7 @@ function endPreamble() {
   if (coolant) block(["M9"]);
   coolant = "";
   coolantAsk = "flood";      // the next section states its own ask
-  block(["MOTOFF"]);
+  block(["M5"]);
   spindleOn = false;
   probeSection = false;
   kindProbe = false;         // the next section states its own tool kind
@@ -447,7 +471,7 @@ function endPreamble() {
 }
 
 function onSection() { seatKnown = false; startPreamble(); }
-function onSectionEnd() { endPreamble(); hopZ = null; }  // #1028: the next section states its own hop
+function onSectionEnd() { endPreamble(); hopZ = null; clearZ = null; }  // #1028, #1633: the next section states its own planes
 
 // ------------------------------------------------------------- motions
 // While a canned-cycle group is open its expanded hole chain is the
@@ -486,16 +510,65 @@ function probeSeat() {
   block(["G80"]);
   inCycle = false;
 }
+// ------------------------------------------------- the first traverse
+// #1633 (#1616's second half; the #1614 hazard): X and Y are unknown at
+// the program's start and after every tool change, and so is the height
+// the change left the tip at - a long tool on a high work offset can
+// stand below the part top there, and a first move written as one
+// combined rapid (`G00 X20 Y10 Z-3`) is a straight line from that point,
+// across the part. So the first X/Y traverse is made at a STATED
+// height: a Z-only rapid to the section's clearance - its
+// ClearancePlane, else its RetractPlane, never below the move's own Z -
+// then X/Y alone at it, then the move as the stream states it. A setup
+// that cannot reach that height is stopped by the control's Z limit
+// instead of rapiding through the part. A stream that states neither
+// plane has no verified height to traverse at: refused by name.
+// This dialect refuses tilted records (tiltOk), so the rapids are always
+// in the frame of the section's upright words.
+var clearZ = null;            // #1633: the section's ClearancePlane, null when unstated
+var xyUnknown = true;         // #1633: at the program's start and after each tool change
+var traverseRefused = false;  // #1633: once per program
+function traverseZ(z) {
+  var c = has(clearZ) ? clearZ : (has(hopZ) ? hopZ : null);
+  if (c === null) return null;
+  return has(z) ? Math.max(c, Number(z)) : c;
+}
+// (x, y, z): a rapid's target (a cycle's hole at its R plane), which the
+// record itself then goes to; or, with `descend`, where the stream says a
+// feed, an arc or a probing move starts - rapided down to when it lies
+// below the clearance, so the move runs only the stretch planned.
+// False when refused: the caller then writes nothing for its move - nor
+// for any later one while X/Y stay unknown (the rest of the section) -
+// so no combined X/Y/Z rapid from an unknown height reaches the text.
+function xyFirst(x, y, z, descend) {
+  if (!xyUnknown || !has(x) || !has(y)) return true;
+  var tz = traverseZ(z);
+  if (tz === null) {
+    if (!traverseRefused) {
+      traverseRefused = true;
+      msg(coolantWho() + "first X/Y traverse with no clearance height stated (no ClearancePlane or RetractPlane) - the post will not rapid X/Y at an unknown height");
+    }
+    return false;
+  }
+  block(["G00", wo("Z", tz, orgZ)]);
+  // A rapid already at the clearance is the traverse itself.
+  if (descend || !has(z) || Math.abs(Number(z) - tz) > 1e-9) block(["G00", wo("X", x, orgX), wo("Y", y, orgY)]);
+  if (descend && has(z) && Number(z) < tz - 1e-9) block(["G00", wo("Z", z, orgZ)]);
+  xyUnknown = false;
+  return true;
+}
 function onRapid() {
   startPreamble();
   compRefuse("a rapid");
   if (!tiltOk(properties) || chainRapid()) return;
+  if (!xyFirst(properties.X, properties.Y, properties.Z, false)) return;  // #1633: refused - the move is not written
   block(["G00"].concat(xyz(properties)));
 }
 function onLinear() {
   startPreamble();
   if (!tiltOk(properties) || chainCut()) return;
   if (spindleStopped("feed move G01")) return;
+  if (!xyFirst(properties.StartX, properties.StartY, properties.StartZ, true)) return;  // #1633: refused - the move is not written
   // The pending comp word rides this straight block (#39).
   var cg = compG, cd = compD;
   compG = ""; compD = "";
@@ -508,6 +581,7 @@ function onCircular() {
   if (spindleStopped("arc move " + (properties.CircularDirection === "CW" ? "G02" : "G03"))) return;
   var p = properties;
   if (compPlaneRefuse(planeOf(p))) return;
+  if (!xyFirst(properties.StartX, properties.StartY, properties.StartZ, true)) return;  // #1633: refused - the move is not written
   block([
     planeWord(planeOf(p)),
     p.CircularDirection === "CW" ? "G02" : "G03",
@@ -575,6 +649,13 @@ function onCycle() {
   else if (p.CycleType === "TAP") g = "G84";
   else if (p.CycleType === "BORE") g = "G86";
   else if (p.CycleType === "BACKBORE") g = "G89";
+  else if (p.CycleType === "REAM") g = "G85";   // #1445: feed in, feed out at F, no dwell
+  else {
+    // #1445: a cycle kind this post does not know is refused by name,
+    // never posted as the G81 default (a rapid out it never asked for).
+    msg("canned cycle " + p.CycleType + " is not known to this post - refused, not posted as another cycle");
+    return;
+  }
   // #1357: a canned cycle feeds at its own F word. Without one the
   // control drills at whatever feed was last modal (or alarms on a zero
   // feed), so a cycle the stream gives no positive feed is refused by name.
@@ -583,6 +664,7 @@ function onCycle() {
     return;
   }
   if (spindleStopped("canned cycle " + g)) return;
+  if (!xyFirst(p.X, p.Y, p.R, false)) return;  // #1633: refused - the move is not written
   cycleSeat(p);
   var sig = g + "|" + p.Z + "|" + p.R + "|" + p.Q;
   if (inCycle && sig === cycleSig) {
@@ -640,6 +722,7 @@ function onProbeMove() {
   startPreamble();
   probeSeat();               // #1028
   compRefuse("a probing move");
+  if (!xyFirst(properties.StartX, properties.StartY, properties.StartZ, true)) return;  // #1633: refused - the move is not written
   var p = properties;
   block(["G31", wo("X", p.X, orgX), wo("Y", p.Y, orgY), wo("Z", p.Z, orgZ), fw(p.Feed)]);
   var ai = travelAxis(p);
@@ -671,6 +754,7 @@ function onProbeGuard() {
   startPreamble();
   probeSeat();               // #1028
   compRefuse("a protected probe move");
+  if (!xyFirst(properties.StartX, properties.StartY, properties.StartZ, true)) return;  // #1633: refused - the move is not written
   var p = properties;
   block(["G31", wo("X", p.X, orgX), wo("Y", p.Y, orgY), wo("Z", p.Z, orgZ), fw(p.Feed)]);
   var to = [p.X, p.Y, p.Z], from = [p.StartX, p.StartY, p.StartZ], org = [orgX, orgY, orgZ];
@@ -678,10 +762,6 @@ function onProbeGuard() {
     if (has(from[ai]) && Math.abs(to[ai] - from[ai]) < 1e-6) continue;  // an axis that holds still
     alarmUnless("ABS[" + minusU("#" + (5061 + ai), to[ai] - org[ai]) + "]LE" + eps(), 3, "PROBE HIT ON POSITIONING");
   }
-}
-function slotOf(word) {  // "G55" -> 1
-  var n = Number(String(word).replace(/[^0-9]/g, "")) - 54;
-  return n >= 0 && n <= 5 ? n : 0;
 }
 function onProbeResult() {
   var p = properties;
@@ -702,7 +782,7 @@ function onProbeResult() {
     alarmUnless("ABS[#" + (dev + i) + "]LE" + fu(p.Tolerance), 1, "PROBE " + a.Axis + " OUT OF TOLERANCE");
   }
   if (has(p.SetWorkOffset) && p.SetWorkOffset >= 0) {
-    var act = 5221 + 20 * slotOf(wcsWord);
+    var act = 5221 + 20 * (wcsIndex - 1);
     var words = ["G10", "L2", "P" + (Number(p.SetWorkOffset) + 1)];
     for (var j = 0; j < axes.length; j++) {
       var aj = axisIx(axes[j].Axis);

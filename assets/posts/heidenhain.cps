@@ -22,6 +22,8 @@ capabilities = 1; // reference contract: integer feature mask (bit 1 = milling)
 coolantModes = true; // reads PARAM Coolant (#112/#150): the engine refuses non-Flood ops for a post without it
 afterModes = true; // reads PARAM AfterOperation (#110): the engine refuses a stop or home ask for a post without it
 floatingTapping = true; // #51: G206 requires the operation's explicit floating-holder choice
+workOffsetIndex = true; // reads PARAM WorkOffset as the 1-based offset number (#931)
+workOffsetMax = 6;      // preset rows 1..6; more rows depend on the machine's preset table, not verified here (#931)
 // #902: millimetres only for now - the engine refuses an inch document by
 // name. The TNC runs inch (G70), but the feed unit its inch programs and
 // cycle Q feeds take was not confirmed from the public manual this post
@@ -272,8 +274,14 @@ function onRadiusCompensation() {
 }
 
 // In DIN/ISO G54 is DATUM SHIFT, not an offset register. Explicit
-// app offsets instead select preset rows through G247 (#51).
+// app offsets instead select preset rows through G247 (#51): offset n
+// is preset-table row n (#931: PARAM WorkOffset is that number).
+function workOffsetName(n) {  // offset n -> what the control calls it; "" when none
+  return n >= 1 && n <= 6 && n === Math.floor(n) ? "preset " + n : "";
+}
 function onParameter(name, value) {
+  if (name === "ClearancePlane") clearZ = has(value) ? Number(value) : null;  // #1633
+  if (name === "RetractPlane") hopZ = has(value) ? Number(value) : null;  // #1633
   if (name === "Smoothing") { smoothTol = Number(value) || 0; return; }
   if (name === "SmoothingMode") { smoothMode = String(value || ""); return; }
   commentParam(name, value);
@@ -281,11 +289,11 @@ function onParameter(name, value) {
   if (name === "Coolant") { coolantAsk = String(value || "flood"); return; }
   if (name === "AfterOperation") { afterAsk = String(value || ""); return; }
   if (name === "WorkOffset" && value) {
-    // House mapping: explicit G54..G59 selects preset-table rows 1..6.
+    // House mapping: offsets 1..6 select preset-table rows 1..6.
     // Legacy streams without WorkOffset keep the control's active preset.
-    var word = String(value), match = /^G5([4-9])$/.exec(word);
-    if (!match) { msg("work offset " + word + " has no configured TNC preset row"); return; }
-    preset = Number(match[1]) - 3;
+    var n = Number(value);
+    if (!workOffsetName(n)) { msg("work offset " + value + " has no configured TNC preset row"); return; }
+    preset = n;
   }
   else if (name === "OriginX" && has(value)) orgX = Number(value);
   else if (name === "OriginY" && has(value)) orgY = Number(value);
@@ -348,6 +356,7 @@ function startPreamble() {
   if (toolWait) {
     toolNote();
     block(["T" + ni(tNo), "G17", spindleWait && sRpm > 0 ? "S" + ff(sRpm) : ""]);
+    xyUnknown = true;          // #1633: the first traverse states its height again
     toolWait = false;
   } else if (spindleWait && sRpm > 0) {
     block(["S" + ff(sRpm)]);
@@ -404,16 +413,67 @@ function endPreamble() {
 }
 
 function onSection() { startPreamble(); }
-function onSectionEnd() { endPreamble(); }
+function onSectionEnd() { endPreamble(); clearZ = null; hopZ = null; }  // #1633: the next section states its own planes
 
 // ------------------------------------------------------------- motions
 // The manual's two-digit G00/G01/G02/G03 (p.752). Native cycles
 // suppress only their replaced axial cuts; safe linking stays explicit.
+// ------------------------------------------------- the first traverse
+// #1633 (#1616's second half; the #1614 hazard): X and Y are unknown at
+// the program's start and after every tool call, and so is the height
+// the change left the tip at - a long tool on a high preset can stand
+// below the part top there, and a first move written as one combined
+// rapid (`G00 G40 G90 X+20 Y+10 Z-3*`) is a straight line from that
+// point, across the part. So the first X/Y traverse is made at a STATED
+// height: a Z-only rapid to the section's clearance - its
+// ClearancePlane, else its RetractPlane, never below the move's own Z -
+// in the manual's own positioning form (`G00 G40 G90 Z+250*`, p. 66;
+// the first motion block carries G40 G90), then X/Y alone at it, then
+// the move as the stream states it. A setup that cannot reach that
+// height is stopped by the control's Z limit instead of rapiding
+// through the part. A stream that states neither plane has no verified
+// height to traverse at: refused by name. This dialect refuses tilted
+// records (tiltOk), so the rapids are in the frame of the section's
+// upright words.
+var clearZ = null;            // #1633: the section's ClearancePlane, null when unstated
+var hopZ = null;              // #1633: the section's RetractPlane, null when unstated
+var xyUnknown = true;         // #1633: at the program's start and after each tool call
+var traverseRefused = false;  // #1633: once per program
+function traverseZ(z) {
+  var c = has(clearZ) ? clearZ : (has(hopZ) ? hopZ : null);
+  if (c === null) return null;
+  return has(z) ? Math.max(c, Number(z)) : c;
+}
+// (x, y, z): a rapid's target (a drilling cycle's hole at its R plane),
+// which the record itself then goes to; or, with `descend`, where the
+// stream says a feed or an arc starts - rapided down to when it lies
+// below the clearance, so the move runs only the stretch planned.
+// False when refused: the caller then writes nothing for its move - nor
+// for any later one while X/Y stay unknown (the rest of the section) -
+// so no combined X/Y/Z rapid from an unknown height reaches the text.
+function xyFirst(x, y, z, descend) {
+  if (!xyUnknown || !has(x) || !has(y)) return true;
+  var tz = traverseZ(z);
+  if (tz === null) {
+    if (!traverseRefused) {
+      traverseRefused = true;
+      msg(coolantWho() + "first X/Y traverse with no clearance height stated (no ClearancePlane or RetractPlane) - the post will not rapid X/Y at an unknown height");
+    }
+    return false;
+  }
+  motion("G00", [wo("Z", tz, orgZ)]);
+  // A rapid already at the clearance is the traverse itself.
+  if (descend || !has(z) || Math.abs(Number(z) - tz) > 1e-9) motion("G00", [wo("X", x, orgX), wo("Y", y, orgY)]);
+  if (descend && has(z) && Number(z) < tz - 1e-9) motion("G00", [wo("Z", z, orgZ)]);
+  xyUnknown = false;
+  return true;
+}
 function onRapid() {
   startPreamble();
   if (!tiltOk(properties)) return;
   if (inCycle && sameHole(properties) && properties.Z <= cycleR + 1e-6) return;
   inCycle = false; // retain the generator's explicit safe lifts/traverses
+  if (!xyFirst(properties.X, properties.Y, properties.Z, false)) return;  // #1633: refused - the move is not written
   motion("G00", xyz(properties));
 }
 function onLinear() {
@@ -424,6 +484,7 @@ function onLinear() {
     return;
   }
   if (spindleStopped("feed move G01")) return;
+  if (!xyFirst(properties.StartX, properties.StartY, properties.StartZ, true)) return;  // #1633: refused - the move is not written
   motion("G01", xyz(properties).concat([fw(properties.FeedRate)]));
   dwellAtBottom(properties.Z);
 }
@@ -484,6 +545,7 @@ function onCircular() {
   if (!tiltOk(properties)) return;
   if (inCycle) { msg("native drilling cycle cannot replace an arc cutting chain"); return; }
   if (spindleStopped("arc move " + (properties.CircularDirection === "CW" ? "G02" : "G03"))) return;
+  if (!xyFirst(properties.StartX, properties.StartY, properties.StartZ, true)) return;  // #1633: refused - the move is not written
   var p = properties;
   if (p.CircularPlane === "XZ" || p.CircularPlane === "YZ") {
     verticalArc(p);
@@ -539,7 +601,8 @@ function onCycle() {
   var p = properties, type = p.CycleType;
   // Boring keeps the established explicit-chain contract; its spindle
   // orientation/disengagement semantics are not part of #51.
-  if (type === "BORE" || type === "BACKBORE") {
+  // #1445: REAM (feed in, feed out, no dwell) rides the same chain.
+  if (type === "BORE" || type === "BACKBORE" || type === "REAM") {
     if (has(p.P) && p.P > 0) pendingDwell = { z: Number(p.Z), s: Number(p.P) };
     cycleSig = "";
     return;
@@ -624,6 +687,7 @@ function onCycle() {
   var sig = words.join("|");
   if (sig !== cycleSig) { block(words); cycleSig = sig; }
   // G40/G90 accompanies explicit hole positioning, never a cycle definition.
+  if (!xyFirst(p.X, p.Y, p.R, false)) return;  // #1633: refused - the move is not written
   motion("G00", [wo("X", p.X, orgX), wo("Y", p.Y, orgY), wo("Z", p.R, orgZ), "M99"]);
 }
 function dwellAtBottom(z) {

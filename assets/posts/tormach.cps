@@ -20,13 +20,17 @@ minimumRevision = 1;
 extension = "nc";
 setCodePage = "utf-8";
 capabilities = 1; // reference contract: integer feature mask (bit 1 = milling)
+workOffsetIndex = true; // reads PARAM WorkOffset as the 1-based offset number (#931)
+workOffsetMax = 9;      // LinuxCNC G-code reference: G54-G59.3 select coordinate systems 1-9 (#931)
 programUnits = "mm inch"; // #902: writes the document's unit (postOptions.Units), G21 / G20
+afterModes = true; // #1532: reads PARAM AfterOperation (stop / optional stop) and PARAM SetupChange; a trip home is refused by name
 
 // Determinism law: no timestamps, no randomness - the same stream
 // always posts to the same text (golden files depend on it).
 
 // ---------------------------------------------------------------- state
 var wcsWord = "G54";       // from the WorkOffset PARAM
+var wcsIndex = 1;          // the offset number wcsWord writes (#931)
 var sRpm = 0;              // spindle/T order follows the stream: PARAMs,
 var spindleWait = false;   // TOOL, SECTION - the preamble writes them
 var toolWait = false;      // when the first motion needs them legal
@@ -36,6 +40,9 @@ var cycleSig = "";         // g|Z|R|Q of the open group (modal X Y holes)
 var cycX = 0, cycY = 0, cycR = 0; // the open group's hole XY and R plane (world, #994)
 var seatKnown = false;     // #994: this section moved, so the stream's Start is where the tool is
 var hopZ = null;           // #1028: the section's RetractPlane (its hop), null when unstated
+var clearZ = null;         // #1614: the section's ClearancePlane, null when unstated
+var afterAsk = "";         // the section's PARAM AfterOperation (#1532), none when unstated
+var setupNext = "";        // the section's PARAM SetupChange (#1532): the setup the program changes to after it
 var coolant = "";          // the M-code this program started, if any
 var sectionOpen = false;   // preamble written (a legacy .cl carries no SECTION)
 var smoothTol = 0;          // #616: the section's PARAM Smoothing, mm (0: none asked)
@@ -280,16 +287,25 @@ function safeZ() {
   return safeZValue;
 }
 
-// Z straight up in machine coordinates, then G30 to the operator's preset
+// Z straight up in machine coordinates, the one retract both the tool
+// change and the program end start with (#1594 split them: only the
+// tool change goes on to G30, see onClose).
+function liftZ() {
+  var z = safeZ();
+  if (z === null) return null;
+  block(["G53", "G0", "Z" + fu(z)]);
+  return z;
+}
+
+// Before a tool change: liftZ, then G30 to the operator's preset
 // tool-change spot. The G30 rides PathPilot's convention with the Z0
 // retract: a machine that states a different safe Z is not on it, and an
 // unset G30 position (LinuxCNC's default is the machine origin) could
 // drive Z back down - so there the retract stands alone and M6 / the
 // control's own tool-change position does the rest.
 function retract() {
-  var z = safeZ();
+  var z = liftZ();
   if (z === null) return;
-  block(["G53", "G0", "Z" + fu(z)]);
   if (z === 0) {
     block(["G30"]);
     // #785 (review of PR #798): a G30 with no axis words moves EVERY
@@ -306,12 +322,28 @@ function onRadiusCompensation() {
   msg("control cutter compensation (G41/G42) is not supported by this post - choose In computer, or the Fanuc post");
 }
 
+// #931: PARAM WorkOffset arrives as the 1-based offset number (the engine
+// refuses one above workOffsetMax by setup name); the word is ours to write.
+function workOffsetName(n) {  // offset n -> this control's word; "" when it has none
+  if (!(n >= 1 && n <= 9 && n === Math.floor(n))) return "";
+  return n <= 6 ? "G" + (53 + n) : "G59." + (n - 6);  // LinuxCNC: G59.1..G59.3 are systems 7-9
+}
+function offsetWord(value) {
+  var n = Number(value), w = workOffsetName(n);
+  if (!w) { msg("work offset " + value + " - this post expresses work offsets 1-" + workOffsetMax + " only"); return wcsWord; }
+  wcsIndex = n;
+  return w;
+}
+
 function onParameter(name, value) {
   if (name === "RetractPlane") hopZ = has(value) ? Number(value) : null;  // #1028
+  if (name === "ClearancePlane") clearZ = has(value) ? Number(value) : null;  // #1614
   if (name === "Smoothing") { smoothTol = Number(value) || 0; return; }
   if (name === "SmoothingMode") { smoothMode = String(value || ""); return; }
   commentParam(name, value);
-  if (name === "WorkOffset" && value) wcsWord = String(value);
+  if (name === "AfterOperation") { afterAsk = String(value || ""); return; }
+  if (name === "SetupChange") { setupNext = clean(value); return; }
+  if (name === "WorkOffset" && value) wcsWord = offsetWord(value);
   else if (name === "OriginX" && has(value)) orgX = Number(value);
   else if (name === "OriginY" && has(value)) orgY = Number(value);
   else if (name === "OriginZ" && has(value)) orgZ = Number(value);
@@ -407,6 +439,13 @@ function startPreamble() {
     xyUnknown = true;        // G30 (or the changer) may have moved X and Y
     block(["T" + ni(tNo), "M6"]);
     block(["G43", "H" + ni(tNo)]);
+    // #1596: Z straight up again (G53, so the G43 just applied does not
+    // shift it) before the section's first X/Y or A move. The G30 above
+    // leaves Z at the operator's stored G30 height, and one stored below
+    // the part top (a PathPilot Hub run had machine Z -1.5611) would
+    // otherwise carry the tool sideways at that height into the part or
+    // the vise. Also after a non-G30 retract: M6 may move Z.
+    liftZ();
     toolWait = false;
   }
   // A touch probe (#108, #362) states 0 rpm: no spindle start, no belt
@@ -441,10 +480,36 @@ function endPreamble() {
   spindleOn = false;
   probeSection = false;
   kindProbe = false;         // the next section states its own tool kind
+  afterOp();
+}
+
+// The op's after-action (#1532), written once its spindle has stopped:
+// M1 / M0 from PARAM AfterOperation. At a setup change (PARAM
+// SetupChange) Z goes straight up first and a PathPilot (MSG, ..) names
+// the next setup, the way the probe check asks the operator (UM10587
+// ch. 10, M0/M1; LinuxCNC "Messages"). A trip home is not written: the
+// G30 spot is the operator's preset, so it is refused by name.
+function afterOp() {
+  var ask = afterAsk;
+  var next = setupNext;
+  afterAsk = "";
+  setupNext = "";
+  if (!ask) return;
+  if (ask !== "optional-stop" && ask !== "stop") {
+    msg(ask === "home"
+      ? "a trip home is asked after the operation" + inOp() + " - this post does not write one (the G30 spot is the operator's preset); set it to Pause (M0) or Continue"
+      : "unknown after-operation ask " + ask);
+    return;
+  }
+  if (next) {
+    liftZ();
+    block(["(MSG, SETUP CHANGE - NEXT: " + next + ")"]);
+  }
+  block([ask === "stop" ? "M0" : "M1"]);
 }
 
 function onSection() { seatKnown = false; startPreamble(); }
-function onSectionEnd() { endPreamble(); hopZ = null; }  // #1028: the next section states its own hop
+function onSectionEnd() { endPreamble(); hopZ = null; clearZ = null; }  // #1028: the next section states its own hop
 
 // ------------------------------------------------------- the 4th axis
 // #785. A rotary table about X (Tormach's microARC 4 or the older 4th-axis
@@ -586,16 +651,53 @@ function indexed() { return !!aSection; }
 // its target; a feed or arc at the point the stream says it starts from
 // (the target when the stream names none); a cycle at its first hole.
 var xyUnknown = true;
+// #1614: the height that traverse is made at is STATED, never assumed.
+// The top of Z travel (G53 G0 Z0, #1596) clears the part only while the
+// tool is short enough for the work offset: a PathPilot Hub run with a
+// 5" T4 and G54 Z zero 4.3" below the top had the tip 0.68" under the
+// part top after G43, and the bare X Y rapid crossed the part there.
+// So an upright section first rapids to its clearance - the stream's
+// ClearancePlane, else its RetractPlane (the hop, #1028), never below
+// the move's own Z. (Not StartZ: the engine starts every stream at 0
+// when it states no start, so that height is not the stream's.) On a
+// setup that can clear, that is an ordinary move down to clearance; on
+// one that cannot, the control refuses the block as past its Z limit
+// and stops, instead of rapiding through the part. A stream that states
+// neither has no verified height to traverse at: refused by name.
+function traverseZ(z) {
+  var c = has(clearZ) ? clearZ : (has(hopZ) ? hopZ : null);
+  if (c === null) return null;
+  return has(z) ? Math.max(c, Number(z)) : c;
+}
+var traverseRefused = false;  // #1614: once per program
+var traversedAt = null;       // #1614: the Z the last first-traverse was made at
+// False when refused: the caller then writes nothing for its move - nor
+// for any later one while X/Y stay unknown (the rest of the section) -
+// so no combined X/Y/Z move from an unknown height reaches the text.
 function xyFirst(x, y, z) {
-  if (!xyUnknown || !has(x) || !has(y)) return;
+  if (!xyUnknown || !has(x) || !has(y)) return true;
+  traversedAt = null;
+  if (!indexed()) {
+    var tz = traverseZ(z);
+    if (tz === null) {
+      if (!traverseRefused) {
+        traverseRefused = true;
+        msg("first X/Y traverse" + inOp() + " with no clearance height stated (no ClearancePlane or RetractPlane) - the post will not rapid X/Y at an unknown height");
+      }
+      return false;
+    }
+    block(["G0", wo("Z", tz, orgZ)]);
+    traversedAt = tz;
+  }
   if (indexed()) {  // #785: X Y of the turned tip, which Z enters
-    if (!has(z)) return;
+    if (!has(z)) return true;
     var q = tip(x, y, z);
     block(["G0", "X" + fu(q[0]), "Y" + fu(q[1])]);
   } else {
     block(["G0", wo("X", x, orgX), wo("Y", y, orgY)]);
   }
   xyUnknown = false;
+  return true;
 }
 // A feed or arc as the first move after a tool change starts, in the
 // stream, from the generator's own start point - its clearance height
@@ -604,19 +706,21 @@ function xyFirst(x, y, z) {
 // plunge rate. Once X Y are positioned, a rapid takes Z down to that
 // start height - where the generator says the tool already is - and the
 // feed runs only the stretch it planned (proven on the 770MX, #131).
-function startXY(p) {
-  if (!xyUnknown) return;
-  if (has(p.StartX) && has(p.StartY)) xyFirst(p.StartX, p.StartY, p.StartZ);
-  else xyFirst(p.X, p.Y, p.Z);
+function startXY(p) {  // false: refused (#1614), the caller writes nothing
+  if (!xyUnknown) return true;
+  var ok = (has(p.StartX) && has(p.StartY)) ? xyFirst(p.StartX, p.StartY, p.StartZ) : xyFirst(p.X, p.Y, p.Z);
+  if (!ok) return false;
   if (!xyUnknown && has(p.StartZ) && has(p.Z) && p.StartZ > p.Z) {
     if (indexed() && has(p.StartX) && has(p.StartY)) {
       // #785: "above" is the indexed frame's Z, the tool axis.
       var s0 = tip(p.StartX, p.StartY, p.StartZ), e0 = tip(p.X, p.Y, p.Z);
       if (s0[2] > e0[2]) block(["G0", "Z" + fu(s0[2])]);
-    } else if (!indexed()) {
+    } else if (!indexed() && !(has(traversedAt) && Math.abs(traversedAt - p.StartZ) < 1e-9)) {
+      // #1614: not when the stated traverse height already is it.
       block(["G0", wo("Z", p.StartZ, orgZ)]);
     }
   }
+  return true;
 }
 
 // While a canned-cycle group is open its expanded hole chain is the
@@ -657,14 +761,14 @@ function probeSeat() {
 function onRapid() {
   startPreamble();
   if (chainRapid() || !indexFor(properties)) return;
-  xyFirst(properties.X, properties.Y, properties.Z);
+  if (!xyFirst(properties.X, properties.Y, properties.Z)) return;  // #1614: refused - the move is not written
   block(["G0"].concat(xyz(properties)));
 }
 function onLinear() {
   startPreamble();
   if (chainCut() || !indexFor(properties)) return;
   if (spindleStopped("feed move G1")) return;
-  startXY(properties);
+  if (!startXY(properties)) return;  // #1614: refused - the move is not written
   block(["G1"].concat(xyz(properties), [fw(properties.FeedRate)]));
 }
 function onCircular() {
@@ -676,7 +780,7 @@ function onCircular() {
     return;
   }
   if (spindleStopped("arc move " + (p.CircularDirection === "CW" ? "G2" : "G3"))) return;
-  startXY(p);
+  if (!startXY(p)) return;  // #1614: refused - the move is not written
   block([
     planeWord(planeOf(p)),
     p.CircularDirection === "CW" ? "G2" : "G3",
@@ -704,7 +808,7 @@ function onProbeGuard() {
   probeSeat();               // #1028
   var p = properties;
   if (!indexFor(p)) return;  // #785: probing is upright (A0 on a 4th axis)
-  startXY(p);
+  if (!startXY(p)) return;  // #1614: refused - the move is not written
   block(["G38.3", wo("X", p.X, orgX), wo("Y", p.Y, orgY), wo("Z", p.Z, orgZ), fw(p.Feed)]);
   guardO += 1;
   block(["o" + guardO, "if", "[#5070 EQ 1]"]);
@@ -772,6 +876,7 @@ function onCycle() {
   else if (p.CycleType === "DEEP") g = "G83";
   else if (p.CycleType === "BORE") g = "G86";
   else if (p.CycleType === "BACKBORE") g = "G89";
+  else if (p.CycleType === "REAM") g = "G85";   // #1445: feed in, feed out at F, no dwell
   // Tormach documents G84 for PathPilot: F is the pitch times the rpm
   // (the stream's synthesized tap feed), no P - PathPilot sizes the
   // bottom dwell itself, and the MX mills tap from the spindle encoder.
@@ -787,6 +892,12 @@ function onCycle() {
     }
     g = "G84";
   }
+  else {
+    // #1445: a cycle kind this post does not know is refused by name,
+    // never posted as the G81 default (a rapid out it never asked for).
+    msg("canned cycle " + p.CycleType + " is not known to this post - refused, not posted as another cycle");
+    return;
+  }
   // #1357: a canned cycle feeds at its own F word. Without one LinuxCNC
   // alarms on a zero feed ("Cannot feed with zero feed rate") or, after
   // an earlier F, drills at whatever feed was last modal - so a cycle
@@ -799,7 +910,7 @@ function onCycle() {
     return;
   }
   if (spindleStopped("canned cycle " + g)) return;
-  xyFirst(p.X, p.Y);         // a cycle as the first move: its first hole
+  if (!xyFirst(p.X, p.Y)) return;  // a cycle as the first move: its first hole (#1614: refused - not written)
   cycleSeat(p);
   var sig = g + "|" + p.Z + "|" + p.R + "|" + p.Q;
   if (inCycle && sig === cycleSig) {
@@ -869,7 +980,7 @@ function onProbeMove() {
   probeSeat();               // #1028
   var p = properties;
   if (!indexFor(p)) return;  // #785: probing is upright (A0 on a 4th axis)
-  xyFirst(p.X, p.Y);       // never a probe from an unknown X Y
+  if (!xyFirst(p.X, p.Y)) return;  // never a probe from an unknown X Y (#1614: refused - not written)
   block(["G38.2", wo("X", p.X, orgX), wo("Y", p.Y, orgY), wo("Z", p.Z, orgZ), fw(p.Feed)]);
   if (has(p.Measure) && p.Measure >= 0) {
     var b = probeBase + 3 * p.Measure;
@@ -927,10 +1038,17 @@ function onProbeResult() {
 // ------------------------------------------------------------ footer
 // G53 G0 Z0 lifts the spindle straight up to the top of Z travel in
 // machine coordinates (Tormach's Z home is at the top; another machine
-// states its own height, #495 - see safeZ), whatever the
-// stored G30 position holds; then G30 takes the machine to the
-// operator's preset G30 location (the unload spot), the way PathPilot's
-// own programs end. M30 ends the program (no % fence).
+// states its own height, #495 - see safeZ), and the program ends there:
+// no G30 follows it and no rotary return (#1594). A G30 with no axis
+// words moves every axis to the stored G30 position (LinuxCNC params
+// 5181-5189), so an operator's G30 stored below the top of travel
+// brought the tool straight back down after the lift. The user's
+// PathPilot Hub run (770MX sim, 2026-11-13, stored G30 at machine
+// Z -1.5611) showed it: an end of G53 G0 Z0 then G30, or G30 alone, drove
+// the tool down below the part top; G53 G0 Z0 alone stayed at the top of
+// travel, the ending the user chose. A G0 A0 after the lift was tried
+// and not wanted. The G30 before each tool change (retract) is
+// unchanged. M30 ends the program (no % fence).
 //
 // #596: LinuxCNC's M2 / M30 (linuxcnc.org/docs, M-codes, "M2, M30
 // Program End") resets offsets to G54, the plane to G17, G90, G94, M48,
@@ -948,7 +1066,7 @@ function endUnitsWord() {
 }
 function onClose() {
   endPreamble();
-  retract();
+  liftZ();               // #1594: straight up and stay there - no G30
   var u = endUnitsWord();
   if (u) block([u]);
   block(["M30"]);

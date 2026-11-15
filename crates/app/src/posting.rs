@@ -18,7 +18,7 @@
 use crate::model;
 use crate::operation::{self, Height, OpStatus, OpParams};
 use crate::post::{self, cnc, engine, Dump};
-use crate::schema::{EndUnits, PostOptions, PostRef, ThreadingOutput, WCS_SLOTS};
+use crate::schema::{EndUnits, PostOptions, PostRef, ThreadingOutput};
 use flecs_ecs::prelude::*;
 use serde_json::Value;
 use std::path::Path;
@@ -51,6 +51,9 @@ pub const BUILTINS: &[(&str, &str)] = &[
     // #533: the generic RS-274 wire EDM post; every EDM code is the
     // machine's `edm.codes` (#290 D5). It serves wire EDMs only.
     ("Generic ISO Wire EDM", include_str!("../../../assets/posts/wire-iso.cps")),
+    // #617: the Sodick 2-axis wire post, its words from Sodick's 1998
+    // operation manual (Mark 21 / EX21); not verified on a control.
+    ("Sodick Wire EDM (Mark 21)", include_str!("../../../assets/posts/sodick-wire.cps")),
     // #542: the generic ISO-style sinker post; every EDM code is the
     // machine's `edm.codes` (#290 D5). It serves sinker EDMs only.
     ("Sinker EDM (ISO)", include_str!("../../../assets/posts/sinker-iso.cps")),
@@ -69,9 +72,10 @@ pub const LATHE_POSTS: &[&str] = &["Fanuc Lathe", "Tormach PathPilot Lathe"];
 pub const PLASMA_POSTS: &[&str] = &["Tormach PathPilot Plasma"];
 
 /// The registry entries that speak WIRE EDM (#533): RS-274 motion with
-/// the control's own codes from the machine file. They serve wire EDMs
-/// only, and no cutting post serves one.
-pub const WIRE_POSTS: &[&str] = &["Generic ISO Wire EDM"];
+/// the control's own codes from the machine file, and (#617) the Sodick
+/// dialect with its manual's words. They serve wire EDMs only, and no
+/// cutting post serves one. The first is the default for a wire EDM.
+pub const WIRE_POSTS: &[&str] = &["Generic ISO Wire EDM", "Sodick Wire EDM (Mark 21)"];
 
 /// The registry entries that speak SINKER EDM (#542): RS-274 motion
 /// with the control's own codes from the machine file, each declaring
@@ -231,12 +235,17 @@ pub const MACHINES: &[(&str, &str)] = &[
     // #707: Makera's desktop mills, from Makera's product spec tables.
     ("Makera Carvera", include_str!("../../../assets/machines/makera-carvera.mch")),
     ("Makera Carvera Air", include_str!("../../../assets/machines/makera-carvera-air.mch")),
+    // #868: the Z1 (manual quick-change, air blast); posted through the Carvera post.
+    ("Makera Z1", include_str!("../../../assets/machines/makera-z1.mch")),
     // #728: Sienci's AltMill routers (SLB-EXT, grblHAL); pair with the "grblHAL" post.
     ("Sienci AltMill 2x4", include_str!("../../../assets/machines/sienci-altmill-2x4.mch")),
     ("Sienci AltMill 4x4", include_str!("../../../assets/machines/sienci-altmill-4x4.mch")),
     ("Sienci AltMill 4x8", include_str!("../../../assets/machines/sienci-altmill-4x8.mch")),
-    // #614: Doosan DNM 5700 VMC (Fanuc 0i-MF).
-    ("Doosan DNM 5700", include_str!("../../../assets/machines/doosan-dnm.mch")),
+    // #614: Doosan DNM 5700 VMC (Fanuc 0i-MF). #1433: the plain 3-axis
+    // machine, and the catalog's optional A table as its own entry (no
+    // published nose_to_axis, so that one refuses until a setup states it).
+    ("Doosan DNM 5700", include_str!("../../../assets/machines/doosan-dnm-3axis.mch")),
+    ("Doosan DNM 5700 + rotary table", include_str!("../../../assets/machines/doosan-dnm.mch")),
 ];
 
 /// The mount path a built-in library entry records (stage C): the
@@ -445,6 +454,8 @@ mod wcs_rotation;
 mod wcs_slot;
 #[path = "posting_mounts.rs"]
 mod mounts;
+#[path = "posting_setup_change.rs"]
+mod setup_change;
 #[path = "posting_program.rs"]
 mod program;
 pub use program::{
@@ -506,7 +517,7 @@ pub fn post_script(world: &World, out_path: &Path, cps: &str) -> Result<Posted, 
 /// the refusal that names a post not serving the machine (#1232).
 fn post_script_as(world: &World, out_path: &Path, cps: &str, label: Option<&str>) -> Result<Posted, String> {
     let started = crate::clock::Instant::now();
-    let posted = post_script_body(world, out_path, cps, label);
+    let posted = post_script_body(world, cps, label).and_then(|p| write_program(out_path, p));
     match &posted {
         Ok(p) => tracing::info!(
             file = %crate::logging::file_name(out_path),
@@ -521,10 +532,35 @@ fn post_script_as(world: &World, out_path: &Path, cps: &str, label: Option<&str>
     posted
 }
 
-fn post_script_body(world: &World, out_path: &Path, cps: &str, label: Option<&str>) -> Result<Posted, String> {
+/// The whole program gate of [`post_setup`] with nothing written (#1431):
+/// the same mount, stream, verification and engine run, the program held
+/// in memory. The browser build hands it to a download, which has no path
+/// to write to; a program over several mounts is refused by name, as the
+/// one-file post refuses it.
+pub fn post_setup_unwritten(world: &World) -> Result<Posted, String> {
+    let (label, cps) = script_of(&mounts::single(world, true)?.post)?;
+    let posted = post_script_body(world, &cps, Some(&label));
+    match &posted {
+        Ok(p) => tracing::info!(bytes = p.program.len(), ops = p.ops, lines = p.lines, "NC program posted, not written"),
+        Err(why) => tracing::warn!("NC program not posted: {why}"),
+    }
+    posted
+}
+
+/// Write a gated program to `out_path`; a failed write removes what it
+/// left, because a half-written program is the silent wrong answer.
+fn write_program(out_path: &Path, posted: Posted) -> Result<Posted, String> {
+    std::fs::write(out_path, posted.program.as_bytes()).map_err(|e| {
+        let _ = std::fs::remove_file(out_path);
+        format!("cannot write {}: {e}", out_path.display())
+    })?;
+    Ok(posted)
+}
+
+fn post_script_body(world: &World, cps: &str, label: Option<&str>) -> Result<Posted, String> {
     // #388: the program's one machine (a program over several refuses).
     let mount = mounts::single(world, false)?;
-    let streams = op_streams(world)?;
+    let streams = op_streams_by(world, false)?;
     // #1190: a turning dialect opens only what a lathe may run.
     crate::lathe_voice::at_post(world, streams.iter().map(|(n, _)| n.as_str()), cps, label)?;
     // #1232: and a post writes only for a machine kind it serves.
@@ -558,10 +594,6 @@ fn post_script_body(world: &World, out_path: &Path, cps: &str, label: Option<&st
             out.warnings.join("; ")
         ));
     }
-    std::fs::write(out_path, out.program.as_bytes()).map_err(|e| {
-        let _ = std::fs::remove_file(out_path); // a half-written program is the silent wrong answer
-        format!("cannot write {}: {e}", out_path.display())
-    })?;
     let ops = records
         .iter()
         .filter(|r| matches!(r, cnc::Record::Section { begin: true }))
@@ -748,9 +780,13 @@ pub fn verification_report_by(world: &World, voice: &dyn Fn(Option<&str>) -> pos
     problems.extend(suppressed::suppressed_problems(world));
     // The rotated-offset clause (#315): the post carries translation only.
     problems.extend(wcs_rotation::rotated_wcs_problems(world));
+    // The offset-range clause (#931): each setup's offset index against
+    // its own post's maximum - never posted at offset 1.
+    problems.extend(crate::setup_offsets::range_problems(world));
     // #389: the setups' post options must agree on what shapes the whole
-    // program (the Output and the thread output) - never posted half one
-    // way. Judged program-wide, ahead of #388's per-mount split.
+    // program (the Output, the thread output and, #1540, the End units) -
+    // never posted half one way. Judged program-wide, ahead of #388's
+    // per-mount split.
     problems.extend(crate::setup_post_options::program_problems(world));
     // #1031/#1174: the work spindle over a setup's workholding maximum,
     // by name - judged for the post dialect each op runs through.
@@ -914,6 +950,14 @@ pub(crate) fn join_streams(streams: Vec<(String, Vec<cnc::Record>)>) -> Vec<cnc:
 /// program order, cycle anchors local to the op - the unit one file per
 /// operation (#111) posts on its own, and [`stream_records`] joins.
 pub fn op_streams(world: &World) -> Result<Vec<(String, Vec<cnc::Record>)>, String> {
+    op_streams_by(world, true)
+}
+
+/// [`op_streams`], with the setup-change stops (#1532) placed for files
+/// grouped as `setup_mount::program_mounts(world, by_post)` groups them:
+/// `false` for an explicit script, which posts every post's setups of a
+/// machine in one file.
+pub(crate) fn op_streams_by(world: &World, by_post: bool) -> Result<Vec<(String, Vec<cnc::Record>)>, String> {
     let ops = program_ops(world)?;
 
     // The T../H.. law (#221): a tool's own number when it has one, else
@@ -931,10 +975,12 @@ pub fn op_streams(world: &World) -> Result<Vec<(String, Vec<cnc::Record>)>, Stri
 
     // #155: Pause / Home entries fold into the gap they stand in; #389:
     // "Skip pauses and homes" is read per op, from its own setup.
-    let afters = crate::program_entry::posted_afters(world, &ops, |e| {
+    let mut afters = crate::program_entry::posted_afters(world, &ops, |e| {
         model::operation_of(world, e)
             .is_some_and(|op| crate::setup_post_options::of(world, op.setup.as_deref()).skip_stops)
     })?;
+    // #1532: a setup change stops for the re-clamp (by default).
+    let changes = setup_change::fold(world, &ops, &mut afters, by_post)?;
     let mut streams = Vec::with_capacity(ops.len());
     for (name, e) in &ops {
         let op = model::operation_of(world, e)
@@ -943,7 +989,9 @@ pub fn op_streams(world: &World) -> Result<Vec<(String, Vec<cnc::Record>)>, Stri
             .ok_or_else(|| format!("{name}: lost its toolpath"))?;
         if let OpParams::WireContour(p) = &op.params {
             let after = afters.get(name).copied().unwrap_or_default();
-            streams.push((name.clone(), wire::stream(world, name, e, &op, &cache, p, after)?));
+            let mut records = wire::stream(world, name, e, &op, &cache, p, after)?;
+            setup_change::ask(&changes, name, &mut records);
+            streams.push((name.clone(), records));
             continue;
         }
         let tool = model::find_by_name(world, &op.tool)
@@ -1071,27 +1119,29 @@ pub fn op_streams(world: &World) -> Result<Vec<(String, Vec<cnc::Record>)>, Stri
         {
             post::ask_reverse_spindle(&mut records);
         }
+        setup_change::ask(&changes, name, &mut records);
         streams.push((name.clone(), records));
     }
     Ok(streams)
 }
 
 /// The work offset an operation of the `setup` context posts to: the
-/// setup's word (#196, #342: its label, else `G54`) and the setup's one
-/// WCS origin as the machine would measure it. `pub(crate)` so the
-/// machine-limit travel check (M2.3 C) reads program coordinates by
-/// exactly this law, not by a second copy of it.
+/// setup's 1-based offset index (#196, #342, #931: its label, else 1)
+/// and the setup's one WCS origin as the machine would measure it.
+/// `pub(crate)` so the machine-limit travel check (M2.3 C) reads program
+/// coordinates by exactly this law, not by a second copy of it.
 ///
-/// The G-code WORD is always `WCS_SLOTS[slot]` - the machine's register
-/// names do not take setup suffixes. The ENTITY the origin is measured
-/// from is the setup's WCS (M3.2 A, #342), whatever word it is labelled.
-pub(crate) fn wcs_context(world: &World, setup: Option<&str>) -> (&'static str, [f64; 3]) {
-    let slot = wcs_slot::wcs_slot(world, setup);
-    let name = WCS_SLOTS[slot];
+/// The stream carries the INDEX; the post writes its own word for it. An
+/// index the post cannot express is never read as offset 1 here - the
+/// gate refuses it by setup name ([`crate::setup_offsets::range_problems`]).
+/// The ENTITY the origin is measured from is the setup's WCS (M3.2 A,
+/// #342), whatever offset it is labelled.
+pub(crate) fn wcs_context(world: &World, setup: Option<&str>) -> (u32, [f64; 3]) {
+    let index = crate::setup_offsets::index(world, setup);
     let origin = crate::setup::wcs_entity(world, setup)
         .and_then(|e| model::transform_of(world, &e))
         .map_or([0.0; 3], |t| [t.pos.x, t.pos.y, t.pos.z]);
-    (name, origin)
+    (index, origin)
 }
 
 /// Every height a parameter set references (the same walk

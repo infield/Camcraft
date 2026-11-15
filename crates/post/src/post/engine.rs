@@ -114,6 +114,7 @@ pub fn run_program_with(
     if let Some(why) = super::units::refusal(&mut s, options)? {
         return Err(PostError::Refused(why));
     }
+    let wo = super::work_offset::Manifest::read(&mut s);
     // #1386: Explain G-code on a script that states no comment form is
     // refused by name here, before any hook runs.
     let explain_form = super::explain::form(&mut s, options)?;
@@ -155,7 +156,24 @@ pub fn run_program_with(
         let before = s.out_len()?;
         let mut swallow = false;
         match r {
-            Record::Param { name, value } => {
+            Record::Param { name, value } => 'param: {
+                // #931: the work offset reaches the script as its number
+                // (flagged) or its legacy word (1-6), or is refused by name.
+                let translated;
+                let value = if name == "WorkOffset" {
+                    match wo.translate(value, &base) {
+                        Ok(v) => {
+                            translated = v;
+                            &translated
+                        }
+                        Err(w) => {
+                            warnings.push(w);
+                            break 'param;
+                        }
+                    }
+                } else {
+                    value
+                };
                 base.insert(name.clone(), value.clone());
                 match name.as_str() {
                     "StartX" => pos.0 = value.as_f64().unwrap_or(0.0),
@@ -180,7 +198,20 @@ pub fn run_program_with(
                 // A post that does not declare `afterModes` would run
                 // straight on past an operator's stop or trip home (#110):
                 // refused by name, a counted warning, never silent.
-                if name == "AfterOperation" && !s.reads_after_operation() {
+                // #1532: the stop of a setup change (its PARAM SetupChange
+                // rides just ahead of the AfterOperation ask) is refused
+                // in the re-clamp's own words, once, not as an op's stop.
+                let setup_change = i > 0
+                    && matches!(records.get(i - 1), Some(Record::Param { name: n, .. }) if n == "SetupChange");
+                if name == "SetupChange" && !s.reads_after_operation() {
+                    let op = base.get("OperationName").and_then(Value::as_str).unwrap_or("");
+                    let who = if op.is_empty() { String::new() } else { format!("operation {op}: ") };
+                    warnings.push(format!(
+                        "{who}the program changes to setup '{}' after it, and this post script does not declare afterModes, so it cannot stop for the re-clamp - choose Run straight on or One file per setup under Between setups, or use a post that reads it",
+                        value.as_str().unwrap_or("")
+                    ));
+                }
+                if name == "AfterOperation" && !s.reads_after_operation() && !setup_change {
                     let op = base.get("OperationName").and_then(Value::as_str).unwrap_or("");
                     let who = if op.is_empty() { String::new() } else { format!("operation {op}: ") };
                     warnings.push(format!(

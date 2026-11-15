@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo/camcraft-logo.png" alt="CamCraft logotype" width="160"></p>
+
 # CamCraft
 
 A CAM system that turns 3D models into NC programs (G-code) for CNC milling
@@ -154,8 +156,7 @@ cargo test --release -p camcraft-app -p camcraft-motion -- --ignored   # slow ve
 
 Golden toolpath and G-code outputs live under each crate's `tests/golden/`.
 Gates run locally through `cargo xtask gate` (see Contributing). GitHub
-Actions runs only on a pushed release tag; the CI and nightly workflows in
-`.github/workflows/` are manual.
+Actions runs only on a pushed release tag (`release.yml`).
 
 ## Project documents
 
@@ -177,6 +178,12 @@ anything about the machine's motion, **UI / UX bug** for the interface, and
 the general bug and feature templates for the rest. If a path would gouge or
 collide and the app did not warn you, please say so. Those reports matter
 most.
+
+## Community
+
+Questions and discussion: join the CamCraft Discord server at
+<https://discord.gg/bBWjkAgX5>. Bug reports and feature requests still go to
+the GitHub issues, so the work stays tracked.
 
 ## Contributing
 

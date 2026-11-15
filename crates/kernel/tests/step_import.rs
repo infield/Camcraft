@@ -249,7 +249,7 @@ fn corrupt_step_files_never_panic_or_hang() {
             verdict(r.map(|i| i.solids.iter().map(|s| s.measure.volume).sum()))
         });
         let b = bytes_for_truck;
-        let t = bounded_cancel(name, CASE_TIMEOUT, move |_| match truck_read(&b, 1.0) {
+        let t = bounded_cancel(name, CASE_TIMEOUT, move |stop| match truck_read(&b, 1.0, stop) {
             Ok(t) => format!("Ok V={:.3} open={}", t.mesh.volume, t.mesh.open_edges),
             Err(e) => {
                 println!("{name:<36} truck: {e}");
@@ -316,4 +316,31 @@ fn importer_keeps_its_size_and_time_bounds() {
         }
         other => panic!("cancelled mid-parse: {other:?}"),
     }
+}
+
+/// #1697: the bench's truck reader on a face whose subdivision never ends
+/// (bspline_discontinuous.step, #1536's fixture) refuses it by name inside
+/// the bound, and obeys a cancelled token; a smooth B-spline still meshes.
+#[test]
+fn truck_side_refuses_a_runaway_face_and_obeys_its_cancel() {
+    let read = |file: &'static str, cancelled: bool| {
+        let bytes = std::fs::read(models_dir().join(file)).unwrap_or_default();
+        assert!(!bytes.is_empty(), "{file}: fixture missing or empty");
+        bounded_cancel(file, CASE_TIMEOUT, move |stop| {
+            if cancelled {
+                stop.cancel();
+            }
+            truck_read(&bytes, 1.0, stop)
+        })
+    };
+    match read("bspline_discontinuous.step", false) {
+        Err(e) => assert!(e.contains("B-spline surface) not meshed: its subdivision did not converge"), "{e}"),
+        Ok(t) => panic!("a runaway face meshed: {t:?}"),
+    }
+    match read("bspline_discontinuous.step", true) {
+        Err(e) => assert!(e.contains("the time bound cancelled its subdivision"), "{e}"),
+        Ok(t) => panic!("a cancelled read meshed: {t:?}"),
+    }
+    let dome = read("bspline_dome.step", false);
+    assert!(dome.as_ref().is_ok_and(|t| t.mesh.triangles > 0), "{dome:?}");
 }

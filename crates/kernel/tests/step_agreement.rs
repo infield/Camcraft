@@ -77,11 +77,35 @@ const ROWS: &[Row] = &[
         import: "agree",
         mesh: "watertight, within tolerance",
     },
+    // #1697: truck's face meter refuses face 6 (the B-spline that jumps);
+    // solidcore refuses the solid at its pcurves (a line on a spline).
+    Row {
+        file: "bspline_discontinuous.step",
+        mm_per_unit: 1.0,
+        import: "both refuse (solidcore: #16 at read: pcurves failed on)",
+        mesh: "no exact solid to judge against",
+    },
+    // FINDING (#1697): solidcore's mesh of the dome stands off the exact
+    // volume by more than REL_TOL; the importers agree.
+    Row {
+        file: "bspline_dome.step",
+        mm_per_unit: 1.0,
+        import: "agree",
+        mesh: "off: volume",
+    },
     Row {
         file: "empty_list.step",
         mm_per_unit: 1.0,
         import: "agree",
         mesh: "watertight, within tolerance",
+    },
+    // solidcore has no exact pcurve of a NURBS on a spline surface (the
+    // corner blend); truck meshes the corner.
+    Row {
+        file: "fillet_corner.step",
+        mm_per_unit: 1.0,
+        import: "solidcore refuses: #1289 at read: pcurves failed on",
+        mesh: "no exact solid to judge against",
     },
     Row {
         file: "lathe_holder_offset.step",
@@ -300,7 +324,7 @@ fn read_one(file: &str, unit: f64) -> Reading {
     let t_sc = t0.elapsed();
     let b = bytes.clone();
     let t0 = Instant::now();
-    let tr = bounded_cancel(file, CASE_TIMEOUT, move |_| truck_read(&b, unit));
+    let tr = bounded_cancel(file, CASE_TIMEOUT, move |stop| truck_read(&b, unit, stop));
     let t_tr = t0.elapsed();
     let t0 = Instant::now();
     let tess = bounded_cancel(file, CASE_TIMEOUT, move |_| solidcore_mesh(&bytes));

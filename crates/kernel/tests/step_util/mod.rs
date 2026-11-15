@@ -10,6 +10,8 @@
 
 #![allow(dead_code)] // each bench binary uses its own part
 
+pub mod truck_guard;
+
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc;
@@ -139,14 +141,16 @@ pub struct TruckStep {
 /// Reads `bytes` with ruststep + truck-stepio and meshes every shell at
 /// the app's chord target. `mm_per_unit` is the file's length unit (the
 /// bench table states it; truck meshes in the file's unit). Every refusal
-/// and every truck panic is an `Err` with its reason.
-pub fn truck_read(bytes: &[u8], mm_per_unit: f64) -> Result<TruckStep, String> {
+/// and every truck panic is an `Err` with its reason. Every face is metered
+/// ([`truck_guard`], #1697): a face whose subdivision does not converge is
+/// refused by name, and `stop` ends the meshing when the bench cancels it.
+pub fn truck_read(bytes: &[u8], mm_per_unit: f64, stop: &CancelToken) -> Result<TruckStep, String> {
     let text = std::str::from_utf8(bytes).map_err(|_| "not valid UTF-8".to_string())?;
-    let read = catch_unwind(AssertUnwindSafe(|| truck_read_text(text, mm_per_unit)));
+    let read = catch_unwind(AssertUnwindSafe(|| truck_read_text(text, mm_per_unit, stop)));
     read.unwrap_or_else(|_| Err("truck panicked on this file".into()))
 }
 
-fn truck_read_text(text: &str, k: f64) -> Result<TruckStep, String> {
+fn truck_read_text(text: &str, k: f64, stop: &CancelToken) -> Result<TruckStep, String> {
     let exchange = ruststep::parser::parse(text).map_err(|e| format!("syntax error: {e}"))?;
     let section = exchange.data.first().ok_or("no DATA section")?;
     let table = Table::from_data_section(section);
@@ -177,7 +181,11 @@ fn truck_read_text(text: &str, k: f64) -> Result<TruckStep, String> {
         // cap, never under truck's floor (all in the file's unit).
         let tol = (extent * 1e-3).min(CHORD_MM / k).max(TRUCK_MIN_TOL);
         chord_mm = chord_mm.max(tol * k);
-        let meshed = cshell.robust_triangulation(tol).to_polygon();
+        let guarded = truck_guard::Guarded::new(cshell, truck_guard::FACE_EVAL_CAP, stop);
+        let meshed = guarded.shell.robust_triangulation(tol).to_polygon();
+        if let Some(why) = guarded.refusal() {
+            return Err(format!("shell #{id}: {why}"));
+        }
         let positions: Vec<P3> = meshed.positions().iter().map(|p| [p.x, p.y, p.z]).collect();
         let mut tris: Vec<[usize; 3]> = Vec::new();
         for face in meshed.face_iter() {

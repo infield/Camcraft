@@ -5,7 +5,7 @@
 //! Provenance: our own tests over our own post; the modal-word reading
 //! from the FANUC 0i-F operator's manual (B-64604EN), behaviour only.
 //!
-//! Gate map (M4.4): covers app::post (doosan-dnm.cps rotary words).
+//! Gate map (M4.4): covers camcraft_post::post (doosan-dnm.cps rotary words).
 //! Lane shape (M4.4): all tests here run in well under a second.
 
 use camcraft_app::machine::parse_mch;
@@ -40,12 +40,14 @@ fn plain_fourth() -> serde_json::Value {
 #[test]
 fn doosan_dnm_writes_a0_after_an_a30_tool() {
     let stream = "\
+PARAM ClearancePlane 5
 TOOL 1 T1
 PARAM SpindleSpeed 6000
 SECTION
 Rapid X 0 Y 0 Z 5000 A 30000
 Feed X 0 Y 0 Z 0 F 100000 A 30000
 ENDSECTION
+PARAM ClearancePlane 5
 TOOL 2 T2
 PARAM SpindleSpeed 6000
 SECTION
@@ -75,6 +77,7 @@ ENDSECTION
 #[test]
 fn doosan_dnm_writes_the_opening_a0_without_tcp() {
     let stream = "\
+PARAM ClearancePlane 5
 TOOL 1 T1
 PARAM SpindleSpeed 6000
 SECTION

@@ -99,6 +99,16 @@ fn user_job(tool_name: &str, src_entity: bool, params: OpParams) -> (World, Tool
     (world, path, warns)
 }
 
+/// The warnings of the user's stock-source pocket. Since #1554 (PR
+/// #1656) the stock as the source clears the stock around the part and
+/// stays off the user's part, so the keep law (#1603) finds no gouge -
+/// asserted here, and the entry laws this suite reads are judged on the
+/// warnings that remain.
+fn beside_the_cut_part(warns: Vec<String>) -> Vec<String> {
+    assert!(!warns.iter().any(|w| w.starts_with("Gouge")), "the stock-source pocket stays off the user's part: {warns:?}");
+    warns
+}
+
 fn with(a: Approach) -> Links {
     Links { approach: a, ..Links::PLANAR }
 }
@@ -156,6 +166,7 @@ fn every_lead_option_on_the_users_part_verifies_silent() {
 fn the_reported_keep_down_helix_pocket_enters_every_level_once() {
     let links = Links { transition: Some(Entry3D::Helix), helix_pitch: 1.0, level: Link::KeepDown, ..Links::PLANAR };
     let (_w, t, warns) = user_job("EM-0600-4FL", false, pocket_op(links));
+    let warns = beside_the_cut_part(warns);
     assert!(warns.is_empty(), "{warns:?}");
     let helix_ends: Vec<usize> = (1..t.moves.len())
         .filter(|&i| {
@@ -227,6 +238,7 @@ fn the_horizontal_arc_entry_on_the_users_pocket_verifies_silent() {
             *e = entry;
         }
         let (_w, t, warns) = user_job("EM-0600-4FL", false, op);
+        let warns = beside_the_cut_part(warns);
         assert!(warns.is_empty(), "{entry:?}: {warns:?} / {:?}", t.notes);
         assert!(t.is_chained() && t.all_finite());
         let first = t.moves.iter().find(|m| m.kind == MoveKind::Feed && m.from.z == m.to.z).expect("a cut");

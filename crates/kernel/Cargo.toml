@@ -17,6 +17,10 @@ truck = ["dep:truck-shapeops", "dep:truck-modeling", "dep:truck-meshalgo"]
 
 [dependencies]
 thiserror = { workspace = true }
+# The Solidcraft reader (#1456): deflate for the .sc ZIP container (already
+# in Cargo.lock through png/tiff), JSON for its manifests.
+flate2 = "1.1"
+serde_json = { workspace = true }
 # The SMLib port (tangency-labs, Apache-2.0, pure Rust, forbid(unsafe_code))
 # and its STEP reader, at ONE commit of the owner's fork (#916): the STEP
 # crate is unpublished and depends by path on the kernel beside it, so the
@@ -42,4 +46,8 @@ camcraft-kernel = { path = ".", features = ["truck"] }
 # pins). Dev-only on purpose: the library gains no truck-stepio.
 truck-stepio = { workspace = true }
 truck-meshalgo = { workspace = true }
+# The bench's face meter (#1697, tests/step_util/truck_guard.rs) builds a
+# CompressedShell of metered faces; truck-stepio does not re-export the type.
+# Already in the workspace (crates/app), at the same pin.
+truck-topology = { workspace = true }
 ruststep = { workspace = true }

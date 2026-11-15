@@ -8,7 +8,7 @@ use crate::state::SetupPage;
 use camcraft_app::operation::{Height, OpParams, SrcRef};
 
 /// Two setups, Setup2 active, its page `page` open.
-fn two_setups(h: &mut Harness<'static, ShellUi>, page: SetupPage) {
+pub(super) fn two_setups(h: &mut Harness<'static, ShellUi>, page: SetupPage) {
     h.state_mut().state.pending.push_back(CommandKind::CreateSetup { name: None, datum_from: None });
     h.state_mut().state.pending.push_back(CommandKind::CreateSetup { name: None, datum_from: None });
     h.run_steps(2);
@@ -30,7 +30,7 @@ fn the_setup_machine_page_takes_its_own_machine() {
 }
 
 /// Open the ComboBox showing `now` and pick `to`, with real pointer events.
-fn pick(h: &mut Harness<'static, ShellUi>, now: &str, to: &str) {
+pub(super) fn pick(h: &mut Harness<'static, ShellUi>, now: &str, to: &str) {
     let at = h
         .get_by(|n| n.role() == egui::accesskit::Role::ComboBox && n.value().as_deref() == Some(now))
         .rect()
@@ -56,7 +56,7 @@ fn the_setup_post_page_takes_its_own_post_through_the_picker() {
 }
 
 /// The Machine page's Library ComboBox text for the active setup's machine.
-fn library_label(h: &Harness<'static, ShellUi>) -> String {
+pub(super) fn library_label(h: &Harness<'static, ShellUi>) -> String {
     let now = camcraft_app::machine::of(&h.state().state.world).0;
     camcraft_app::posting::MACHINES
         .iter()
@@ -78,15 +78,17 @@ fn the_setup_machine_page_picks_its_own_machine_from_the_library() {
     assert_eq!(camcraft_app::setup_mount::own_machine(&st.world, Some("Setup1")), None, "Setup1 is untouched");
 }
 
-/// The face the app fixtures cut: the catalog end mill over the stock.
+/// The face the app fixtures cut: the catalog end mill over the stock,
+/// 0.5 mm off its top and above the seeded 30 mm block (#1657: a face
+/// through the block is a true gouge on the stock-source keep law).
 fn face() -> OpParams {
     OpParams::Face {
         holes: Default::default(),
         blend_turns: false,
         tilt: None,
         stepover: 3.0,
-        clearance_z: Height::fixed(25.0),
-        cut_z: Height::fixed(19.5),
+        clearance_z: Height::fixed(45.0),
+        cut_z: Height::fixed(31.5),
         top_z: None,
         stepdown: None,
         feed: 1200.0,
@@ -122,9 +124,13 @@ fn each_setup_picks_its_own_machine_and_post_and_posts_one_file_per_mount() {
     h.run_steps(2);
     // Each setup gets the same box to cut (a new setup has no stock); Setup2
     // also gets its work offset on the box's top face. Then each its face.
+    // The box holds the seeded 60 x 60 x 30 block with 3 mm to spare on
+    // every side and 2 mm on top (#1657: the parts must stand inside the
+    // stock; a 2 mm side spare puts the 4 mm mill's last pass exactly on
+    // the stock edge, which the section law reads as a gouge - #1659).
     let box_stock = || CommandKind::SetStock {
-        shape: camcraft_app::stock::StockShape::Box { dx: 60.0, dy: 60.0, dz: 20.0 },
-        pos: [0.0; 3],
+        shape: camcraft_app::stock::StockShape::Box { dx: 66.0, dy: 66.0, dz: 32.0 },
+        pos: [30.0, 30.0, 0.0],
         yaw_deg: 0.0,
     };
     h.state_mut().state.pending.push_back(CommandKind::ActivateSetup(Some("Setup1".into())));
@@ -132,7 +138,7 @@ fn each_setup_picks_its_own_machine_and_post_and_posts_one_file_per_mount() {
     h.state_mut().state.pending.push_back(CommandKind::CreateOperation { name: "Face1".into(), tool: TOOL.into(), src: SrcRef::Stock, params: face() });
     h.state_mut().state.pending.push_back(CommandKind::ActivateSetup(Some("Setup2".into())));
     h.state_mut().state.pending.push_back(box_stock());
-    h.state_mut().state.pending.push_back(CommandKind::SetWcs { pos: [0.0, 0.0, 20.0], roll_deg: 0.0, pitch_deg: 0.0, yaw_deg: 0.0 });
+    h.state_mut().state.pending.push_back(CommandKind::SetWcs { pos: [0.0, 0.0, 32.0], roll_deg: 0.0, pitch_deg: 0.0, yaw_deg: 0.0 });
     h.state_mut().state.pending.push_back(CommandKind::CreateOperation { name: "Face2".into(), tool: TOOL.into(), src: SrcRef::Stock, params: face() });
     h.run_steps(2);
     // Setup2 (active) takes its own machine and post on its own pages.

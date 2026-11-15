@@ -299,6 +299,12 @@ impl Script {
         self.present.iter().any(|(h, yes)| *h == name && *yes)
     }
 
+    /// Evaluate a manifest read (#931, `work_offset`) in the script's
+    /// context.
+    pub(super) fn eval_src(&mut self, src: &str) -> Result<JsValue, PostError> {
+        self.eval(src)
+    }
+
     fn eval(&mut self, src: &str) -> Result<JsValue, PostError> {
         self.ctx
             .eval(Source::from_bytes(src.as_bytes()))
@@ -356,6 +362,13 @@ impl Script {
     pub fn arm_explain(&mut self, f: super::explain::Form) -> Result<(), PostError> {
         self.eval(&format!("_explainForm = {{ semi: {}, max: {} }};", f.semi, f.max))?;
         Ok(())
+    }
+
+    /// Why the script's own word meanings (#1399) cannot be used, or
+    /// `None` when they can (or it states none).
+    pub fn explain_refusal(&mut self) -> Result<Option<String>, PostError> {
+        let v = self.eval("_explainCheck()")?;
+        Ok(v.as_string().map(|s| s.to_std_string_escaped()).filter(|s| !s.is_empty()))
     }
 
     /// Publish the document's post options once (issue #34).

@@ -4,7 +4,10 @@
 // carvera-community.gitbook.io, firmware -> supported commands -> GCodes
 // and MCodes, read 2026-11-10) and the Carvera instruction manual
 // (coordinates, tool changer, wireless probe) - behavior only, per this
-// repo's Clean-Room Protocol. The hook contract from Autodesk's published
+// repo's Clean-Room Protocol. Where M6 leaves the spindle (#1616): the
+// firmware's open GPL source on GitHub (MakeraInc/CarveraFirmware and
+// Carvera-Community/Carvera_Community_Firmware, ATCHandler.cpp and
+// Robot.cpp, read 2026-11-14), read for behavior only. The hook contract from Autodesk's published
 // post docs. No vendor post script text and no CAM post's output used;
 // original work. Structure follows our own tormach.cps; drilling as its
 // expanded chain follows our own heidenhain.cps.
@@ -16,6 +19,8 @@ minimumRevision = 1;
 extension = "nc";
 setCodePage = "utf-8";
 capabilities = 1; // reference contract: integer feature mask (bit 1 = milling)
+workOffsetIndex = true; // reads PARAM WorkOffset as the 1-based offset number (#931)
+workOffsetMax = 6;      // G54..G59; extended offsets not verified for this firmware (#931)
 coolantModes = true; // reads PARAM Coolant (#869): the op's ask is posted, or refused by name
 programUnits = "mm"; // #902: millimetres only - the engine refuses an inch document by name
 
@@ -24,6 +29,7 @@ programUnits = "mm"; // #902: millimetres only - the engine refuses an inch docu
 
 // ---------------------------------------------------------------- state
 var wcsWord = "G54";       // from the WorkOffset PARAM
+var wcsIndex = 1;          // the offset number wcsWord writes (#931)
 var sRpm = 0;              // spindle/T order follows the stream: PARAMs,
 var spindleWait = false;   // TOOL, SECTION - the preamble writes them
 var toolWait = false;      // when the first motion needs them legal
@@ -207,16 +213,30 @@ function onRadiusCompensation() {
   msg("control cutter compensation (G41/G42) is not in the Carvera firmware - choose In computer");
 }
 
+// #931: PARAM WorkOffset arrives as the 1-based offset number (the engine
+// refuses one above workOffsetMax by setup name); the word is ours to write.
+function workOffsetName(n) {  // offset n -> this control's word; "" when it has none
+  return n >= 1 && n <= 6 && n === Math.floor(n) ? "G" + (53 + n) : "";
+}
+function offsetWord(value) {
+  var n = Number(value), w = workOffsetName(n);
+  if (!w) { msg("work offset " + value + " - this post expresses work offsets 1-" + workOffsetMax + " only"); return wcsWord; }
+  wcsIndex = n;
+  return w;
+}
+
 function onParameter(name, value) {
   if (name === "Smoothing") { smoothTol = Number(value) || 0; return; }
   if (name === "SmoothingMode") { smoothMode = String(value || ""); return; }
   if (name === "Coolant") { coolantAsk = String(value || "flood"); return; }
   if (name === "OperationName") coolantOp = String(value || "");
   commentParam(name, value);
-  if (name === "WorkOffset" && value) wcsWord = String(value);
+  if (name === "WorkOffset" && value) wcsWord = offsetWord(value);
   else if (name === "OriginX" && has(value)) orgX = Number(value);
   else if (name === "OriginY" && has(value)) orgY = Number(value);
   else if (name === "OriginZ" && has(value)) orgZ = Number(value);
+  else if (name === "ClearancePlane") clearZ = has(value) ? Number(value) : null;  // #1616
+  else if (name === "RetractPlane") hopZ = has(value) ? Number(value) : null;  // #1616
 }
 
 function onSpindleSpeed() {
@@ -299,25 +319,63 @@ function endPreamble() {
 }
 
 function onSection() { startPreamble(); }
-function onSectionEnd() { endPreamble(); }
+function onSectionEnd() { endPreamble(); clearZ = null; hopZ = null; }  // #1616: the next section states its own planes
 
 // ------------------------------------------------------------- motions
-// X and Y are unknown at the program's start and after a tool change: the
-// first move positions X Y alone at the current (changer-raised) height,
-// and only then does Z come down - never a diagonal from wherever the
-// changer left the spindle. A feed's first move rapids Z to the height
-// the generator says the tool starts from, then feeds the stretch planned.
+// X and Y are unknown at the program's start and after a tool change, so
+// the first move positions X Y alone - never a diagonal from wherever the
+// changer left the spindle - with its height STATED (#1616, the #1614
+// hazard): a Z-only rapid to the section's clearance - its
+// ClearancePlane, else its RetractPlane, never below the move's own Z.
+// A setup that cannot reach it is stopped by the control's Z limit
+// instead of rapiding through the part. A stream that states neither
+// plane has no verified height to traverse at: refused by name.
+// Z first everywhere, right after M6 T too (#1616). The firmware's
+// public source (MakeraInc/CarveraFirmware and the Carvera Community
+// firmware, ATCHandler::on_main_loop) ends every M6 with
+// G53 G0 Z<coordinate.clearance_z> - a few mm under the top of Z travel,
+// where Z homes - then G53 G0 X Y back to the machine X/Y it read when the
+// M6 arrived. The spindle is not left over the tool rack: it stands where
+// the program put it before the change (the previous section's last
+// move), so the Z-only rapid down to the clearance is made there. The
+// firmware's soft Z limit halts a G0 Z above its top, so a tool too long
+// to reach the clearance stops the program before the traverse instead
+// of crossing the part (docs/decisions/1616-carvera-after-m6.md).
+// A feed's first move then rapids Z to the height the generator says the
+// tool starts from, and feeds only the stretch planned.
 var xyUnknown = true;
-function xyFirst(x, y) {
+var clearZ = null;            // #1616: the section's ClearancePlane, null when unstated
+var hopZ = null;              // #1616: the section's RetractPlane, null when unstated
+var traverseRefused = false;  // #1616: once per program
+var traversedAt = null;       // #1616: the Z the last first-traverse was made at
+function traverseZ(z) {
+  var c = has(clearZ) ? clearZ : (has(hopZ) ? hopZ : null);
+  if (c === null) return null;
+  return has(z) ? Math.max(c, Number(z)) : c;
+}
+function xyFirst(x, y, z) {
   if (!xyUnknown || !has(x) || !has(y)) return;
+  traversedAt = null;
+  var tz = traverseZ(z);
+  if (tz === null) {
+    if (!traverseRefused) {
+      traverseRefused = true;
+      msg(coolantWho() + "first X/Y traverse with no clearance height stated (no ClearancePlane or RetractPlane) - the post will not rapid X/Y at an unknown height");
+    }
+    return;
+  }
+  block(["G0", wo("Z", tz, orgZ)]);
   block(["G0", wo("X", x, orgX), wo("Y", y, orgY)]);
+  traversedAt = tz;
   xyUnknown = false;
 }
 function startXY(p) {
   if (!xyUnknown) return;
-  if (has(p.StartX) && has(p.StartY)) xyFirst(p.StartX, p.StartY);
-  else xyFirst(p.X, p.Y);
-  if (!xyUnknown && has(p.StartZ) && has(p.Z) && p.StartZ > p.Z) {
+  if (has(p.StartX) && has(p.StartY)) xyFirst(p.StartX, p.StartY, p.StartZ);
+  else xyFirst(p.X, p.Y, p.Z);
+  // #1616: not when the stated traverse height already is it.
+  if (!xyUnknown && has(p.StartZ) && has(p.Z) && p.StartZ > p.Z &&
+      !(has(traversedAt) && Math.abs(traversedAt - p.StartZ) < 1e-9)) {
     block(["G0", wo("Z", p.StartZ, orgZ)]);
   }
 }
@@ -325,7 +383,7 @@ function startXY(p) {
 function onRapid() {
   startPreamble();
   if (!tiltOk(properties)) return;
-  xyFirst(properties.X, properties.Y);
+  xyFirst(properties.X, properties.Y, properties.Z);
   block(["G0"].concat(xyz(properties)));
 }
 function onLinear() {
